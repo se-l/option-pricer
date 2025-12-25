@@ -6,7 +6,7 @@
 
 namespace py = pybind11;
 
-PYBIND11_MODULE(berlin, m) {
+PYBIND11_MODULE(merlin, m) {
     m.doc() = "CUDA-accelerated American option implied volatility calculator";
 
     // New simplified interface with single dividend schedule

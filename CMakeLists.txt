@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 set(CMAKE_CUDA_ARCHITECTURES 89)
-project(berlin LANGUAGES CXX CUDA)
+project(merlin LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
@@ -24,20 +24,27 @@ enable_language(CUDA)
 find_package(CUDAToolkit REQUIRED)
 
 # Build the Python extension module
-pybind11_add_module(berlin MODULE
+pybind11_add_module(merlin MODULE
         src/python/bindings.cpp
         src/core/option_pricer.cu
         src/core/calibration/ssvi.cpp
 )
 
-target_include_directories(berlin PRIVATE
+# Install the extension into the top-level of the package
+install(TARGETS merlin
+        LIBRARY DESTINATION .          # Unix-like
+        ARCHIVE DESTINATION .          # just in case
+        RUNTIME DESTINATION .          # Windows .pyd/.dll
+)
+
+target_include_directories(merlin PRIVATE
         ${Python3_INCLUDE_DIRS}
         ${Python3_NumPy_INCLUDE_DIRS}
 )
 
-target_link_libraries(berlin PRIVATE
+target_link_libraries(merlin PRIVATE
         CUDA::cudart
 )
 
 # On some platforms ensure no "lib" prefix for Python module
-set_target_properties(berlin PROPERTIES PREFIX "")
+set_target_properties(merlin PROPERTIES PREFIX "")
