@@ -1,8 +1,8 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
-#include "../core/option_pricer.h"
-#include "../core/calibration/ssvi.h"
+#include "../../src/core/option_pricer.h"
+#include "../../src/core/calibration/ssvi.h"
 
 namespace py = pybind11;
 
@@ -12,10 +12,20 @@ PYBIND11_MODULE(merlin, m) {
     // New simplified interface with single dividend schedule
     m.def("get_v_iv_fd_single_underlying", &get_v_iv_fd_cuda,
           "Compute implied volatilities with single dividend schedule for all options",
-          py::arg("prices"), py::arg("spots"), py::arg("strikes"), py::arg("tenors"), py::arg("rights"),
-          py::arg("r"), py::arg("n_steps") = 100,
+          py::arg("prices"),
+          py::arg("spots"),
+          py::arg("strikes"),
+          py::arg("tenors"),
+          py::arg("rights"),
+          py::arg("r"),
+          py::arg("n_steps") = 100,
           py::arg("div_amounts") = std::vector<float>(),
-          py::arg("div_times") = std::vector<float>());
+          py::arg("div_times") = std::vector<float>(),
+          py::arg("tol") = 1e-6f,
+          py::arg("max_iter") = 200,
+          py::arg("v_min") = 1e-4f,
+          py::arg("v_max") = 5.0f
+          );
 
     // Keep existing functions for compatibility
     m.def("get_v_iv_fd_with_term_structure", &get_v_iv_fd_with_term_structure_cuda,

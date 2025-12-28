@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>net6.0</TargetFrameworks>
+    <AssemblyName>Merlin</AssemblyName>
+    <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+    <Version>0.1.17</Version>
+    <Authors>Sebastian Lueneburg</Authors>
+    <Description>C# wrapper for Merlin CUDA-accelerated Option Pricing Library</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Include the Native DLL in the NuGet package -->
+    <!-- We place it in 'runtimes/win-x64/native' for standard .NET discovery -->
+    <None Include="..\..\build\bin\Release\merlin_native.dll" Pack="true" PackagePath="runtimes/win-x64/native/merlin_native.dll">
+    </None>
+  </ItemGroup>
+
+</Project>

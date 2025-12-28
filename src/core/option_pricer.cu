@@ -10,12 +10,11 @@
 // =======================
 
 __device__ float price_american_binomial_cash_div_threadlocal(
-    float S, float K, float T, float r, float sigma, int is_call, int n_steps,
+    float S, float K, float T, float r, float sigma, bool is_call, int n_steps,
     const float* div_amounts, const int* div_steps, int n_divs)
 {
     constexpr int MAX_STEPS = 512;
     float V[MAX_STEPS + 1];
-    float stock[MAX_STEPS + 1];
 
     // Defensive bound for exponent
     if (n_steps > MAX_STEPS) n_steps = MAX_STEPS;
@@ -51,18 +50,22 @@ __device__ float price_american_binomial_cash_div_threadlocal(
 
     int N = effective_steps;
 
+    // Precompute u and d multipliers to avoid powf in the loop
+    float u2 = u * u;
+    float curr_S = S * powf(d, N); // Start at the bottom node (all down moves)
+
     // 1. Build the vector of stock prices at maturity, with all dividends applied.
     // We'll do this per-path for each end node.
     for (int j = 0; j <= N; ++j) {
-        float S_j = S;
-        int n_up = j;
-        int n_down = N - j;
+        float S_j = curr_S;
+        // int n_up = j;
+        // int n_down = N - j;
         // Build the actual exercise path: Up N times, Down N-j times in some order.
         // The step at which dividend occurs depends on step
         // Because dividend is at discrete step, we must apply at steps = div_steps[i]
         // For each step, know how many ups happened so far:
         // Since order doesn't matter for stock, we can do the math up front.
-        S_j *= powf(u, n_up) * powf(d, n_down);
+        // S_j *= powf(u, n_up) * powf(d, n_down);
 
         // Rewind: For each dividend, subtract the amount at the step (if any).
         // To accurately do this, "reverse-apply" for all dividends that come before expiry.
@@ -78,15 +81,15 @@ __device__ float price_american_binomial_cash_div_threadlocal(
                 int ups_before_div = (step_div <= j) ? step_div : j;
                 int downs_before_div = step_div - ups_before_div;
                 // Calculate the stock price path up to div step
-                float S_before = S * powf(u, ups_before_div) * powf(d, downs_before_div);
+                // float S_before = S * powf(u, ups_before_div) * powf(d, downs_before_div);
                 // At this node, subtract the dividend (apply at step_div)
                 S_j -= div_amounts[div_i] * powf(u, j - ups_before_div) * powf(d, (N - j) - downs_before_div);
                 // Stock can not become negative
                 if (S_j < 1e-8f) S_j = 1e-8f;
             }
         }
-        stock[j] = S_j;
         V[j] = is_call ? fmaxf(S_j - K, 0.0f) : fmaxf(K - S_j, 0.0f);
+        curr_S *= u2; // Move to the next node: replaces one 'd' with one 'u'
     }
 
     // 2. Backward induction
@@ -103,7 +106,7 @@ __device__ float price_american_binomial_cash_div_threadlocal(
                         // Dividend paid at step_div
                         int ups_before_div = (step_div <= j) ? step_div : j;
                         int downs_before_div = step_div - ups_before_div;
-                        float S_before = S * powf(u, ups_before_div) * powf(d, downs_before_div);
+                        // float S_before = S * powf(u, ups_before_div) * powf(d, downs_before_div);
                         S_j -= div_amounts[div_i] * powf(u, j - ups_before_div) * powf(d, (step - j) - downs_before_div);
                         if (S_j < 1e-8f) S_j = 1e-8f;
                     }
@@ -140,6 +143,64 @@ __device__ float implied_vol_american_bisection_threadlocal(
     return mid;
 }
 
+__device__ float american_binomial_delta_fd(
+    float S, float K, float T, float r, float sigma, int is_call, int n_steps,
+    const float* div_amounts, const int* div_steps, int n_divs,
+    float rel_shift = 1e-4f)
+{
+    float h = S * rel_shift;
+    if (h < 1e-6f) h = 1e-6f;
+    float up = price_american_binomial_cash_div_threadlocal(
+        S + h, K, T, r, sigma, is_call, n_steps, div_amounts, div_steps, n_divs);
+    float down = price_american_binomial_cash_div_threadlocal(
+        S - h, K, T, r, sigma, is_call, n_steps, div_amounts, div_steps, n_divs);
+    return (up - down) / (2.0f * h);
+}
+
+__device__ float american_binomial_vega_fd(
+    float S, float K, float T, float r, float sigma, int is_call, int n_steps,
+    const float* div_amounts, const int* div_steps, int n_divs,
+    float abs_shift = 1e-4f)
+{
+    float h = fmaxf(abs_shift, sigma * 1e-2f);  // Robust shift for high vols
+    float up = price_american_binomial_cash_div_threadlocal(
+        S, K, T, r, sigma + h, is_call, n_steps, div_amounts, div_steps, n_divs);
+    float down = price_american_binomial_cash_div_threadlocal(
+        S, K, T, r, sigma - h, is_call, n_steps, div_amounts, div_steps, n_divs);
+    return (up - down) / (2.0f * h);
+}
+
+__device__ float implied_vol_american_newton_threadlocal(
+        float target, float S, float K, float T, float r, int is_call, int n_steps,
+        const float* div_amounts, const int* div_steps, int n_divs,
+        float tol = 1e-5f, int max_iter = 20, float v_min = 1e-4f, float v_max = 5.0f,
+        float initial_guess = 0.3f)
+{
+    // Initial guess: Corrado-Miller or simple 0.3
+    float sigma = initial_guess;
+
+    for (int i = 0; i < max_iter; ++i) {
+        float p = price_american_binomial_cash_div_threadlocal(S, K, T, r, sigma, is_call, n_steps, div_amounts, div_steps, n_divs);
+        float diff = p - target;
+        if (fabsf(diff) < tol) return sigma;
+
+        float v = american_binomial_vega_fd(S, K, T, r, sigma, is_call, n_steps, div_amounts, div_steps, n_divs);
+
+        // Avoid division by zero or tiny vega
+        if (fabsf(v) < 1e-6f) {
+            // Fallback to a small bisection step if vega is too small
+            sigma += (diff > 0) ? -0.01f : 0.01f;
+        } else {
+            float step = diff / v;
+            sigma -= step;
+        }
+
+        if (sigma <= 0.0f) sigma = v_min;
+        if (sigma > v_max) sigma = v_max;
+    }
+    return sigma;
+}
+
 // =======================
 // Main IV kernel: no shared memory needed
 // =======================
@@ -148,7 +209,8 @@ __global__ void compute_iv_kernel_threadlocal(
     const float* prices, const float* spots, const float* strikes, const float* tenors,
     const int* rights, float r, int n_steps, int n_options,
     const float* div_amounts, const float* div_times, int n_divs,
-    float* results) {
+    float* results,
+    float tol = 1e-6f, int max_iter = 100, float v_min = 1e-4f, float v_max = 5.0f) {
 
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n_options) return;
@@ -190,7 +252,8 @@ __global__ void compute_iv_kernel_threadlocal(
 
     results[idx] = implied_vol_american_bisection_threadlocal(
         p, s, k, t, r, right, n_steps,
-        local_div_amounts, local_div_steps, valid_divs
+        local_div_amounts, local_div_steps, valid_divs,
+        tol, max_iter, v_min, v_max
     );
 }
 
@@ -205,7 +268,12 @@ std::vector<float> get_v_iv_fd_cuda(
     float r,
     int n_steps = 200,
     const std::vector<float>& div_amounts = {},
-    const std::vector<float>& div_times = {}) {
+    const std::vector<float>& div_times = {},
+    float tol = 1e-6f,
+    int max_iter = 100,
+    float v_min = 1e-4f,
+    float v_max = 5.0f
+    ) {
 
     int n_options = prices.size();
     std::vector<float> results(n_options);
@@ -252,7 +320,8 @@ std::vector<float> get_v_iv_fd_cuda(
 
     compute_iv_kernel_threadlocal<<<grid_size, block_size>>>(
         d_prices, d_spots, d_strikes, d_tenors, d_rights, r, n_steps, n_options,
-        d_div_amounts, d_div_times, n_divs, d_results
+        d_div_amounts, d_div_times, n_divs, d_results,
+        tol, max_iter, v_min, v_max
     );
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess)
@@ -272,32 +341,184 @@ std::vector<float> get_v_iv_fd_cuda(
     return results;
 }
 
-__device__ float american_binomial_delta_fd(
-    float S, float K, float T, float r, float sigma, int is_call, int n_steps,
-    const float* div_amounts, const int* div_steps, int n_divs,
-    float rel_shift = 1e-4f)
+// ... existing code ...
+__global__ void compute_single_iv_parallel_kernel(
+    float target, float S, float K, float T, float r, bool is_call, int n_steps,
+    const float* d_div_amounts, const int* d_div_steps, int n_divs,
+    float v_min, float v_max, float* d_out_bracket)
 {
-    float h = S * rel_shift;
-    if (h < 1e-6f) h = 1e-6f;
-    float up = price_american_binomial_cash_div_threadlocal(
-        S + h, K, T, r, sigma, is_call, n_steps, div_amounts, div_steps, n_divs);
-    float down = price_american_binomial_cash_div_threadlocal(
-        S - h, K, T, r, sigma, is_call, n_steps, div_amounts, div_steps, n_divs);
-    return (up - down) / (2.0f * h);
+    // Each thread calculates the price for a specific volatility in the current bracket
+    int idx = threadIdx.x;
+    int num_threads = blockDim.x;
+
+    float step = (v_max - v_min) / (num_threads - 1);
+    float sigma = v_min + idx * step;
+
+    float price = price_american_binomial_cash_div_threadlocal(
+        S, K, T, r, sigma, is_call, n_steps, d_div_amounts, d_div_steps, n_divs
+    );
+
+    // We store the difference to the target price
+    d_out_bracket[idx] = price - target;
 }
 
-__device__ float american_binomial_vega_fd(
-    float S, float K, float T, float r, float sigma, int is_call, int n_steps,
-    const float* div_amounts, const int* div_steps, int n_divs,
-    float abs_shift = 1e-4f)
+float get_single_iv_cuda(
+    float price, float S, float K, float T, const bool is_call, float r,
+    int n_steps = 200,
+    const std::vector<float>& div_amounts = {},
+    const std::vector<float>& div_times = {},
+    float tol = 1e-5f, int max_outer_iters = 5)
 {
-    float h = fmaxf(abs_shift, sigma * 1e-2f);  // Robust shift for high vols
-    float up = price_american_binomial_cash_div_threadlocal(
-        S, K, T, r, sigma + h, is_call, n_steps, div_amounts, div_steps, n_divs);
-    float down = price_american_binomial_cash_div_threadlocal(
-        S, K, T, r, sigma - h, is_call, n_steps, div_amounts, div_steps, n_divs);
-    return (up - down) / (2.0f * h);
+    // 1. Setup Dividends
+    int n_divs = div_amounts.size();
+    std::vector<int> div_steps(n_divs);
+    for(int i=0; i<n_divs; ++i) {
+        div_steps[i] = static_cast<int>(roundf(div_times[i] / T * n_steps));
+    }
+
+    float *d_div_amounts = nullptr, *d_results;
+    int *d_div_steps = nullptr;
+
+    const int num_samples = 256; // Use 256 threads to split the bracket
+    cudaMalloc(&d_results, num_samples * sizeof(float));
+    if (n_divs > 0) {
+        cudaMalloc(&d_div_amounts, n_divs * sizeof(float));
+        cudaMalloc(&d_div_steps, n_divs * sizeof(int));
+        cudaMemcpy(d_div_amounts, div_amounts.data(), n_divs * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_div_steps, div_steps.data(), n_divs * sizeof(int), cudaMemcpyHostToDevice);
+    }
+
+    float v_min = 1e-4f, v_max = 4.0f;
+    std::vector<float> h_results(num_samples);
+
+    // 2. Parallel Bracketing Loop
+    // Each iteration reduces the search space by a factor of 255
+    for (int iter = 0; iter < max_outer_iters; ++iter) {
+        compute_single_iv_parallel_kernel<<<1, num_samples>>>(
+            price, S, K, T, r, is_call, n_steps, d_div_amounts, d_div_steps, n_divs,
+            v_min, v_max, d_results
+        );
+        cudaMemcpy(h_results.data(), d_results, num_samples * sizeof(float), cudaMemcpyDeviceToHost);
+
+        // Find where the sign flips (where price - target crossing zero)
+        int cross_idx = 0;
+        for (int i = 0; i < num_samples - 1; ++i) {
+            if (h_results[i] * h_results[i+1] <= 0) {
+                cross_idx = i;
+                break;
+            }
+        }
+
+        float new_v_min = v_min + cross_idx * (v_max - v_min) / (num_samples - 1);
+        float new_v_max = v_min + (cross_idx + 1) * (v_max - v_min) / (num_samples - 1);
+
+        v_min = new_v_min;
+        v_max = new_v_max;
+
+        if ((v_max - v_min) < tol) break;
+    }
+
+    // Cleanup
+    cudaFree(d_results);
+    if (d_div_amounts) { cudaFree(d_div_amounts); cudaFree(d_div_steps); }
+
+    return (v_min + v_max) * 0.5f;
 }
+
+float price_american_binomial_cpu(
+    float S, float K, float T, float r, float sigma, bool is_call, int n_steps,
+    const std::vector<float>& div_amounts, const std::vector<float>& div_times)
+{
+    if (T <= 0) return is_call ? std::max(S - K, 0.0f) : std::max(K - S, 0.0f);
+
+    // 1. PRE-CALCULATE CONSTANTS (Outside the loops)
+    const float dt = T / n_steps;
+    const float v_sq = sigma * sigma;
+
+    // Using the Jarrow-Rudd (Drift-Centered) parameters that matched your QL values
+    const float u = std::exp((r - 0.5f * v_sq) * dt + sigma * std::sqrt(dt));
+    const float d = std::exp((r - 0.5f * v_sq) * dt - sigma * std::sqrt(dt));
+    const float p = 0.5f;
+    const float disc = std::exp(-r * dt);
+    const float p_disc = p * disc;
+    const float q_disc = (1.0f - p) * disc;
+
+    // 2. STACK ALLOCATION (Much faster than std::vector)
+    // Use a fixed size or a small buffer. 512 is plenty for IV.
+    float V[513];
+    int N = (n_steps > 512) ? 512 : n_steps;
+
+    // 3. INITIALIZE TERMINAL NODES (Incremental multiplication instead of std::pow)
+    float curr_S = S * std::pow(d, N);
+    const float u_over_d = u / d;
+
+    for (int j = 0; j <= N; ++j) {
+        float St = curr_S;
+        // Dividend adjustment (only if needed)
+        if (!div_amounts.empty()) {
+            for (size_t i = 0; i < div_amounts.size(); ++i) {
+                if (div_times[i] < T) St = std::max(St - div_amounts[i], 0.0f);
+            }
+        }
+        V[j] = is_call ? std::max(St - K, 0.0f) : std::max(K - St, 0.0f);
+        curr_S *= u_over_d; // Incremental: S * d^(N-j) * u^j
+    }
+
+    // 4. BACKWARD INDUCTION (Optimized loop)
+    for (int i = N - 1; i >= 0; --i) {
+        // Pre-calculate S for the bottom of this step
+        float S_node = S * std::pow(d, i);
+
+        for (int j = 0; j <= i; ++j) {
+            // Continuation value (Avoid repeated multiplication)
+            float continuation = p_disc * V[j + 1] + q_disc * V[j];
+
+            // Exercise value
+            float exercise = is_call ? std::max(S_node - K, 0.0f) : std::max(K - S_node, 0.0f);
+
+            V[j] = std::max(exercise, continuation);
+            S_node *= u_over_d; // Incremental S for the next node up
+        }
+    }
+    return V[0];
+}
+
+float get_single_iv_cpu(
+    float target_price, float S, float K, float T, bool is_call, float r,
+    const std::vector<float>& div_amounts, const std::vector<float>& div_times,
+    float tol, int max_iter, const float steps_factor = 1)
+{
+    float low = 0.0001f, high = 5.0f;
+
+    // We start with a baseline step count
+    float current_steps = (T < 0.01 ? 256 : 32) * steps_factor;  // About to expire, need high time resolution from the start.
+
+    // Check boundaries
+    if (target_price <= 0) return 0.0f;
+
+    for (int i = 0; i < max_iter; ++i) {
+        float mid = (low + high) * 0.5f;
+        float price = price_american_binomial_cpu(S, K, T, r, mid, is_call, static_cast<int>(current_steps), div_amounts, div_times);
+
+        if (std::abs(price - target_price) < tol) return mid;
+        if (price < target_price) low = mid;
+        else high = mid;
+
+        float error = std::abs(price - target_price);
+        if (error < tol) break;
+
+        // DECISION LOGIC: Increase steps based on how close we are (error-based)
+        // If error is less than 50 cents, use 64 steps
+        // If error is less than 5 cents, use 128 steps
+        // If error is less than 1 cent, use 256 steps
+        if (error < 0.01f)      current_steps = max(current_steps, 256 * steps_factor);
+        else if (error < 0.05f) current_steps = max(current_steps, 128 * steps_factor);
+        else if (error < 0.50f) current_steps = max(current_steps, 64 * steps_factor);
+        else                    current_steps = max(current_steps, 32 * steps_factor);
+    }
+    return (low + high) * 0.5f;
+}
+
 // Device kernels for vectorized price, delta, vega (each option can have distinct sigma)
 
 __global__ void compute_price_kernel_threadlocal(

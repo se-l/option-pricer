@@ -25,7 +25,7 @@ find_package(CUDAToolkit REQUIRED)
 
 # Build the Python extension module
 pybind11_add_module(merlin MODULE
-        src/python/bindings.cpp
+        bindings/python/bindings.cpp
         src/core/option_pricer.cu
         src/core/calibration/ssvi.cpp
 )
@@ -48,3 +48,18 @@ target_link_libraries(merlin PRIVATE
 
 # On some platforms ensure no "lib" prefix for Python module
 set_target_properties(merlin PROPERTIES PREFIX "")
+
+# 2. New Shared Library for C# / .NET
+add_library(merlin_lib SHARED
+        src/core/option_pricer.cu
+        src/core/calibration/ssvi.cpp
+        bindings/csharp/merlin_c_api.h
+        bindings/csharp/merlin_c_api.cpp
+)
+set_target_properties(merlin_lib PROPERTIES OUTPUT_NAME "merlin_native")
+
+# Ensure CUDA is linked to the DLL
+target_link_libraries(merlin_lib PRIVATE CUDA::cudart)
+
+# Install both
+install(TARGETS merlin_lib RUNTIME DESTINATION bin LIBRARY DESTINATION lib)

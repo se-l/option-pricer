@@ -5,8 +5,8 @@ build-backend = "scikit_build_core.build"
 [project]
 name = "merlin"
 version = "0.1.0"
-author = "Sebastian Lueneburg"
-author-email = "sebastian.lueneburg@gmail.com"
+#author = "Sebastian Lueneburg"
+#author-email = "sebastian.lueneburg@gmail.com"
 description = "Merlin Python extension (pybind11 + CUDA)"
 requires-python = ">=3.8"
 dependencies = ["numpy"]
@@ -15,7 +15,8 @@ dependencies = ["numpy"]
 build.verbose = true
 # A list of args to pass to CMake when configuring the project.
 cmake.args = ["-G Ninja"]
+cmake.source-dir = "../.."
 
 # The build type to use when building the project.
-cmake.build-type = "Debug"
+cmake.build-type = "Release"
 
