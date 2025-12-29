@@ -4,7 +4,7 @@
     <TargetFrameworks>net6.0</TargetFrameworks>
     <AssemblyName>Merlin</AssemblyName>
     <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
-    <Version>0.1.17</Version>
+    <Version>0.1.27</Version>
     <Authors>Sebastian Lueneburg</Authors>
     <Description>C# wrapper for Merlin CUDA-accelerated Option Pricing Library</Description>
   </PropertyGroup>

@@ -9,48 +9,43 @@ namespace py = pybind11;
 PYBIND11_MODULE(merlin, m) {
     m.doc() = "CUDA-accelerated American option implied volatility calculator";
 
-    // New simplified interface with single dividend schedule
     m.def("get_v_iv_fd_single_underlying", &get_v_iv_fd_cuda,
-          "Compute implied volatilities with single dividend schedule for all options",
+          "Compute implied volatilities with yield curve and single dividend schedule",
           py::arg("prices"),
           py::arg("spots"),
           py::arg("strikes"),
           py::arg("tenors"),
-          py::arg("rights"),
-          py::arg("r"),
-          py::arg("n_steps") = 100,
+          py::arg("v_is_call"),
+          py::arg("rates_curve") = std::vector<float>(),
+          py::arg("rates_times") = std::vector<float>(),
           py::arg("div_amounts") = std::vector<float>(),
           py::arg("div_times") = std::vector<float>(),
           py::arg("tol") = 1e-6f,
           py::arg("max_iter") = 200,
           py::arg("v_min") = 1e-4f,
-          py::arg("v_max") = 5.0f
+          py::arg("v_max") = 5.0f,
+          py::arg("steps_factor") = 1.0f
           );
 
-    // Keep existing functions for compatibility
-    m.def("get_v_iv_fd_with_term_structure", &get_v_iv_fd_with_term_structure_cuda,
-          "Compute implied volatilities using finite difference pricer with time-dependent risk-free rate (slower)",
-          py::arg("prices"), py::arg("spots"), py::arg("strikes"), py::arg("tenors"), py::arg("rights"),
-          py::arg("r_curve"), py::arg("time_points"), py::arg("n_steps") = 100,
-          py::arg("div_amounts") = std::vector<float>(),
-          py::arg("div_times") = std::vector<float>());
-
     m.def("get_v_fd_price", &get_v_fd_price_cuda,
-    "Compute American option prices in vectorized fashion with per-option sigma",
-    py::arg("spots"), py::arg("strikes"), py::arg("tenors"), py::arg("rights"),
-    py::arg("sigmas"), py::arg("r"), py::arg("n_steps") = 100,
+    "Compute American option prices in vectorized fashion with per-option sigma and yield curve",
+    py::arg("spots"), py::arg("strikes"), py::arg("tenors"), py::arg("v_is_call"),
+    py::arg("sigmas"), py::arg("n_steps") = 100,
+    py::arg("rates_curve") = std::vector<float>(), py::arg("rates_times") = std::vector<float>(),
     py::arg("div_amounts") = std::vector<float>(), py::arg("div_times") = std::vector<float>());
 
     m.def("get_v_fd_delta", &get_v_fd_delta_cuda,
-        "Compute American option deltas in vectorized fashion with per-option sigma",
-        py::arg("spots"), py::arg("strikes"), py::arg("tenors"), py::arg("rights"),
-        py::arg("sigmas"), py::arg("r"), py::arg("n_steps") = 100,
+        "Compute American option deltas in vectorized fashion with per-option sigma and yield curve",
+        py::arg("spots"), py::arg("strikes"), py::arg("tenors"), py::arg("v_is_call"),
+        py::arg("sigmas"), py::arg("n_steps") = 100,
+        py::arg("rates_curve") = std::vector<float>(), py::arg("rates_times") = std::vector<float>(),
         py::arg("div_amounts") = std::vector<float>(), py::arg("div_times") = std::vector<float>());
 
     m.def("get_v_fd_vega", &get_v_fd_vega_cuda,
-        "Compute American option vegas in vectorized fashion with per-option sigma",
-        py::arg("spots"), py::arg("strikes"), py::arg("tenors"), py::arg("rights"),
-        py::arg("sigmas"), py::arg("r"), py::arg("n_steps") = 100,
+        "Compute American option vegas in vectorized fashion with per-option sigma and yield curve",
+        py::arg("spots"), py::arg("strikes"), py::arg("tenors"), py::arg("v_is_call"),
+        py::arg("sigmas"), py::arg("n_steps") = 100,
+        py::arg("rates_curve") = std::vector<float>(), py::arg("rates_times") = std::vector<float>(),
         py::arg("div_amounts") = std::vector<float>(), py::arg("div_times") = std::vector<float>());
 
     // Calibration residuals: E-SSVI -> IV -> Price -> residuals
@@ -62,11 +57,12 @@ PYBIND11_MODULE(merlin, m) {
         py::arg("s"),
         py::arg("k"),
         py::arg("t"),
-        py::arg("rights"),
+        py::arg("v_is_call"),
         py::arg("mny_fwd_ln"),
         py::arg("tenor_index"),
-        py::arg("r"),
-        py::arg("n_steps") = 100,
+        py::arg("n_steps") = 200,
+        py::arg("rates_curve") = std::vector<float>(),
+        py::arg("rates_times") = std::vector<float>(),
         py::arg("div_amounts") = std::vector<float>(),
         py::arg("div_times") = std::vector<float>());
 

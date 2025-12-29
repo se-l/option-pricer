@@ -1,7 +1,6 @@
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
-#include <string>
 #include <vector>
 #include "../option_pricer.h"
 
@@ -31,16 +30,17 @@ std::vector<float> f_min_price_surface_theta_rho_psi_cuda(
     const std::vector<float>& s,
     const std::vector<float>& k,
     const std::vector<float>& t,
-    const std::vector<std::string>& rights,
+    const std::vector<uint8_t>& v_is_call,
     const std::vector<float>& mny_fwd_ln,
     const std::vector<int>& tenor_index,
-    float r,
-    int n_steps,
-    const std::vector<float>& div_amounts,
-    const std::vector<float>& div_times
+    const int n_steps = 200,
+    const std::vector<float>& rates_curve = {},
+    const std::vector<float>& rates_times = {},
+    const std::vector<float>& div_amounts = {},
+    const std::vector<float>& div_times = {}
 ) {
     const size_t n_opts = s.size();
-    if (k.size() != n_opts || t.size() != n_opts || rights.size() != n_opts ||
+    if (k.size() != n_opts || t.size() != n_opts || v_is_call.size() != n_opts ||
         mny_fwd_ln.size() != n_opts || item_prices.size() != n_opts || tenor_index.size() != n_opts) {
         throw std::runtime_error("Input size mismatch in f_min_price_surface_theta_rho_psi_cuda");
     }
@@ -71,7 +71,9 @@ std::vector<float> f_min_price_surface_theta_rho_psi_cuda(
 
     // Price using existing CUDA pricer
     std::vector<float> model_prices = get_v_fd_price_cuda(
-        s, k, t, rights, model_iv, r, n_steps, div_amounts, div_times
+        s, k, t, v_is_call, model_iv, n_steps,
+        rates_curve, rates_times,
+        div_amounts, div_times
     );
 
     // Residuals = model - market
