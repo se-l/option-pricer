@@ -2,7 +2,7 @@
 
 // Platform-specific symbol visibility macros
 #ifdef _WIN32
-    #ifdef BUILDING_DLL
+    #ifdef MERLIN_EXPORTS
         #define API __declspec(dllexport)
     #else
         #define API __declspec(dllimport)

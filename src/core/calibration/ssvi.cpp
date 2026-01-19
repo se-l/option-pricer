@@ -2,7 +2,7 @@
 #include <cmath>
 #include <stdexcept>
 #include <vector>
-#include "../option_pricer.h"
+#include "../pricing_engine.h"
 
 // Helper: E-SSVI total variance
 static inline float essvi_total_variance(float mny_fwd_ln, float theta, float rho, float psi) {
@@ -71,7 +71,7 @@ std::vector<float> f_min_price_surface_theta_rho_psi_cuda(
 
     // Price using existing CUDA pricer
     std::vector<float> model_prices = get_v_fd_price_cuda(
-        s, k, t, v_is_call, model_iv, n_steps,
+        s, k, t, model_iv, v_is_call,
         rates_curve, rates_times,
         div_amounts, div_times
     );
