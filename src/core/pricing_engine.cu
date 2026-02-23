@@ -1,8 +1,15 @@
 #include "pricing_engine.h"
+
+#include <algorithm>
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 #include <stdexcept>
+#include <unordered_map>
 
+
+// --- NEW: precomputed per-tenor rate/discount schedules (to avoid curve interpolation in FD loop) ---
+constexpr int MAX_TIME_STEPS_SCHED = 256;
+constexpr int RATE_SCHED_STRIDE = MAX_TIME_STEPS_SCHED + 1; // store [0..N_t] inclusive
 
 // Device version of tridiagonal solver (Thomas algorithm)
 __device__ inline void solve_tridiagonal_cuda(
@@ -13,17 +20,22 @@ __device__ inline void solve_tridiagonal_cuda(
     float* d)        // RHS         [0..n-1], overwritten by solution
 {
     // Use stack arrays for temporaries
-    constexpr int MAX_GRID = 512;
+    constexpr int MAX_GRID = 257;
     float c_star[MAX_GRID];
     float d_star[MAX_GRID];
 
-    if (n > MAX_GRID) return; // Safety check
+    if (n > MAX_GRID) return; // Safety check (but now matches FD cap)
 
     c_star[0] = c[0] / b[0];
     d_star[0] = d[0] / b[0];
 
     for (int i = 1; i < n; ++i) {
-        float m = 1.0f / (b[i] - a[i] * c_star[i - 1]);
+        float denom = (b[i] - a[i] * c_star[i - 1]);
+
+        // Prevent division by (near-)zero leading to inf/NaN
+        if (fabsf(denom) < 1e-20f) denom = (denom < 0.0f ? -1e-20f : 1e-20f);
+
+        float m = 1.0f / denom;
         c_star[i] = (i < n - 1) ? (c[i] * m) : 0.0f;
         d_star[i] = (d[i] - a[i] * d_star[i - 1]) * m;
     }
@@ -61,6 +73,124 @@ __device__ inline float get_rate_at_time(float t, const float *rates_curve, cons
     return rates_curve[n_points - 1];
 }
 
+// --- NEW: Monotone-convex style instantaneous forward from zero curve R(0,t) ---
+__device__ inline float get_rate_at_time_convex_monotone(
+    float t,
+    const float* rates_curve,
+    const float* rates_times,
+    int n_points)
+{
+    if (n_points <= 0) return 0.0f;
+    if (t <= 0.0f) return rates_curve[0];
+
+    if (t <= rates_times[0]) return rates_curve[0];
+    if (t >= rates_times[n_points - 1]) return rates_curve[n_points - 1];
+
+    int k = 0;
+    for (int i = 0; i < n_points - 1; ++i) {
+        if (t <= rates_times[i + 1]) { k = i; break; }
+    }
+
+    auto Z = [&](int i) -> float { return rates_curve[i] * rates_times[i]; };
+    auto f_interval = [&](int i) -> float {
+        float t0 = rates_times[i];
+        float t1 = rates_times[i + 1];
+        float h  = t1 - t0;
+        if (!(h > 0.0f)) return 0.0f;
+        return (Z(i + 1) - Z(i)) / h;
+    };
+    auto clampf = [&](float x, float lo, float hi) -> float {
+        return fminf(fmaxf(x, lo), hi);
+    };
+
+    auto fhat = [&](int i) -> float {
+        if (i <= 0) return f_interval(0);
+        if (i >= n_points - 1) return f_interval(n_points - 2);
+
+        float fL = f_interval(i - 1);
+        float fR = f_interval(i);
+
+        if (fL * fR <= 0.0f) return 0.0f;
+
+        float hL = rates_times[i] - rates_times[i - 1];
+        float hR = rates_times[i + 1] - rates_times[i];
+        float wL = 2.0f * hR + hL;
+        float wR = hR + 2.0f * hL;
+
+        float denom = (wL / fL) + (wR / fR);
+        if (fabsf(denom) < 1e-20f) return 0.0f;
+        float fh = (wL + wR) / denom;
+
+        float lo = fminf(fL, fR);
+        float hi = fmaxf(fL, fR);
+        return clampf(fh, lo, hi);
+    };
+
+    float t0 = rates_times[k];
+    float t1 = rates_times[k + 1];
+    float h  = t1 - t0;
+    if (!(h > 0.0f)) return rates_curve[k];
+
+    float x    = (t - t0) / h;
+    float fbar = f_interval(k);
+    float fL   = fhat(k);
+    float fR   = fhat(k + 1);
+
+    float c = 6.0f * (fbar - 0.5f * (fL + fR));
+
+    float f_mid = 0.5f * (fL + fR) + 0.25f * c;
+    float lo = fminf(fL, fR);
+    float hi = fmaxf(fL, fR);
+    if (f_mid < lo || f_mid > hi) {
+        float target = (f_mid < lo) ? lo : hi;
+        c = 4.0f * (target - 0.5f * (fL + fR));
+    }
+
+    float f = fL + (fR - fL) * x + c * x * (1.0f - x);
+    f = clampf(f, lo - 1e6f, hi + 1e6f);
+    if (!isfinite(f)) return rates_curve[k];
+    return f;
+}
+
+__device__ inline float get_Z_at_time(float t, const float* rates_curve,
+                                      const float* rates_times, int n_points) {
+    // Z(t) = R(t) * t with linear interpolation on (time, Z) points.
+    if (n_points <= 0) return 0.0f;
+    if (t <= 0.0f) return 0.0f;
+
+    if (t <= rates_times[0]) {
+        return rates_curve[0] * t;
+    }
+    if (t >= rates_times[n_points - 1]) {
+        return rates_curve[n_points - 1] * t;
+    }
+
+    for (int i = 0; i < n_points - 1; ++i) {
+        if (t <= rates_times[i + 1]) {
+            float t0 = rates_times[i];
+            float t1 = rates_times[i + 1];
+            float z0 = rates_curve[i] * t0;
+            float z1 = rates_curve[i + 1] * t1;
+
+            float w = (t - t0) / (t1 - t0);
+            return (1.0f - w) * z0 + w * z1;
+        }
+    }
+    return rates_curve[n_points - 1] * t;
+}
+
+__device__ inline float df_0_t(float t, const float* rates_curve,
+                               const float* rates_times, int n_points) {
+    return expf(-get_Z_at_time(t, rates_curve, rates_times, n_points));
+}
+
+__device__ inline float df_t_T(float t, float T, const float* rates_curve,
+                               const float* rates_times, int n_points) {
+    float Zt = get_Z_at_time(t, rates_curve, rates_times, n_points);
+    float ZT = get_Z_at_time(T, rates_curve, rates_times, n_points);
+    return expf(-(ZT - Zt));
+}
+
 __device__ float calculate_pv_of_dividends(
     float T,
     const float* rates_curve,
@@ -74,10 +204,11 @@ __device__ float calculate_pv_of_dividends(
     for (int i = 0; i < n_divs; ++i) {
         float t_div = div_times[i];
         if (t_div > 0.0f && t_div <= T) {
-            float r_div = get_rate_at_time(t_div, rates_curve, rates_times, n_rates);
-            pv_divs += div_amounts[i] * expf(-r_div * t_div);
+            // Use curve-consistent discount factor D(0,t_div)
+            pv_divs += div_amounts[i] * df_0_t(t_div, rates_curve, rates_times, n_rates);
         }
     }
+    return pv_divs;
 }
 
 // Build dividend schedule
@@ -88,123 +219,93 @@ struct DivEvent {
 };
 constexpr int MAX_DIV_EVENTS = 32;
 
-__device__ void precompute_dividends_cuda(
-        float T, int time_steps,
-        const float* rates_curve, const float* rates_times, int n_rates,
-        const float* div_amounts, const float* div_times, int n_divs,
-        float& out_pv_divs, DivEvent* out_div_events, int& out_n_div_events) {
-
-    out_pv_divs = 0.0f;
-    for (int i = 0; i < n_divs; ++i) {
-        float t_div = div_times[i];
-        if (t_div > 0.0f && t_div <= T) {
-            float r_div = get_rate_at_time(t_div, rates_curve, rates_times, n_rates);
-            out_pv_divs += div_amounts[i] * expf(-r_div * t_div);
-        }
-    }
-
-    out_n_div_events = 0;
-    float dt = T / static_cast<float>(time_steps);
-
-    for (int k = 0; k < n_divs && out_n_div_events < MAX_DIV_EVENTS; ++k) {
-        float tD = div_times[k];
-        if (tD > 0.0f && tD < T) {
-            int step = static_cast<int>(floorf(tD / dt));
-            if (step < 0) step = 0;
-            if (step >= time_steps) step = time_steps - 1;
-            out_div_events[out_n_div_events++] = {step, div_amounts[k], tD};
-        }
-    }
-}
-
-__device__ float price_american_fd_div_cuda(
-    float S, float K, float T,
-    float sigma, uint8_t is_call,
+__device__ float price_american_fd_cuda(
+    const float S, const float K, const float T,
+    const float sigma_eval, const uint8_t is_call,
     const float* rates_curve,
     const float* rates_times,
-    int n_rates,
-    float pv_divs,
+    const int n_rates,
+    const float pv_divs,
     const DivEvent* div_events,
-    int n_div_events,
-    int time_steps = 200,
-    int space_steps = 200
-    )
+    const int n_div_events,
+    const int time_steps,
+    const int space_steps,
+    const float* r_sched,        // NEW: length RATE_SCHED_STRIDE
+    const float* df_tT_sched)     // NEW: length RATE_SCHED_STRIDE
 {
-    constexpr int MAX_TIME_STEPS = 512;
-    constexpr int MAX_SPACE_STEPS = 512;
+    constexpr int MAX_TIME_STEPS = 256;
+    constexpr int MAX_SPACE_STEPS = 256;
 
-    if (T <= 0.0f || S <= 0.0f || K <= 0.0f || sigma <= 0.0f)
+    if (T <= 0.0f || S <= 0.0f || K <= 0.0f || sigma_eval <= 0.0f)
         return is_call ? fmaxf(S - K, 0.0f) : fmaxf(K - S, 0.0f);
 
-    // Bound the grid sizes
     const int N_t = (time_steps < 10) ? 10 : ((time_steps > MAX_TIME_STEPS) ? MAX_TIME_STEPS : time_steps);
     const int N_s = (space_steps < 10) ? 10 : ((space_steps > MAX_SPACE_STEPS) ? MAX_SPACE_STEPS : space_steps);
 
     const float dt = T / static_cast<float>(N_t);
+    // Use precomputed r(0) when available; fall back to curve if schedule not provided.
+    const float r0 = (r_sched != nullptr) ? r_sched[0]
+        : get_rate_at_time_convex_monotone(0.0f, rates_curve, rates_times, n_rates);
 
-    // float S_grid_center = fmaxf(S - pv_divs, S * 0.1f);
-
-    // Build spatial grid - match host version exactly
-    float r0 = get_rate_at_time(0.0f, rates_curve, rates_times, n_rates);
-
-    // For puts, ensure grid goes low enough to capture deep ITM scenarios
-    float S_min = 0.0f;  // Always start at zero for puts
-    float S_max = fmaxf(
-        (S + pv_divs) * expf((r0 + 4.0f * sigma) * T),
+    // IMPORTANT: build the domain using sigma_grid (constant during IV solve)
+    constexpr float S_min = 0.0f;
+    const float S_max = fmaxf(
+        (S + pv_divs) * expf(fminf(r0 * T + 4.0f * sigma_eval * sqrt(T), 80.0f)),  // 80 protects against overflow
         3.0f * fmaxf(S, K)
     );
 
     const float dS = (S_max - S_min) / static_cast<float>(N_s);
 
-    // Stock price grid (stack array)
     float S_grid[MAX_SPACE_STEPS + 1];
     for (int i = 0; i <= N_s; ++i) {
         S_grid[i] = S_min + i * dS;
     }
 
-    // Terminal condition and working arrays
     float V[MAX_SPACE_STEPS + 1];
     float a[MAX_SPACE_STEPS + 1], b[MAX_SPACE_STEPS + 1], c[MAX_SPACE_STEPS + 1];
     float rhs[MAX_SPACE_STEPS + 1];
+    float V_new[MAX_SPACE_STEPS + 1];
 
     for (int i = 0; i <= N_s; ++i) {
-        float payoff = is_call
-            ? fmaxf(S_grid[i] - K, 0.0f)
-            : fmaxf(K - S_grid[i], 0.0f);
+        float payoff = is_call ? fmaxf(S_grid[i] - K, 0.0f) : fmaxf(K - S_grid[i], 0.0f);
         V[i] = payoff;
     }
 
     // Backward time stepping
     for (int n = N_t - 1; n >= 0; --n) {
-        float t = n * dt;
-        float r = get_rate_at_time(t, rates_curve, rates_times, n_rates);
+        const float t = n * dt;
 
-        // Crank-Nicolson with theta = 0.5
+        // Use precomputed instantaneous forward rate r(t) when available.
+        const float r = (r_sched != nullptr) ? r_sched[n]
+            : get_rate_at_time_convex_monotone(t, rates_curve, rates_times, n_rates);
+
         const float theta = 0.5f;
-        const float sigma2 = sigma * sigma;
+        const float sigma2 = sigma_eval * sigma_eval;
 
-        // Interior points: i = 1 to N_s - 1
         for (int i = 1; i < N_s; ++i) {
-            float Si = S_grid[i];
-            if (Si < 1e-8f) continue; // Skip near-zero nodes
+            const float Si = S_grid[i];
+            if (Si < 1e-8f) {
+                a[i] = 0.0f;
+                b[i] = 1.0f;
+                c[i] = 0.0f;
+                rhs[i] = V[i];
+                continue;
+            }
 
-            float Si2 = Si * Si;
+            const float Si2 = Si * Si;
 
-            // Standard FD coefficients in price space
-            float coef_pp = 0.5f * sigma2 * Si2 / (dS * dS);  // S²σ²/2
-            float coef_p = 0.5f * r * Si / dS;                 // rS/2
-            float coef_0 = -sigma2 * Si2 / (dS * dS) - r;     // -S²σ² - r
+            const float coef_pp = 0.5f * sigma2 * Si2 / (dS * dS);
+            const float coef_p  = 0.5f * r * Si / dS;
+            const float coef_0  = -sigma2 * Si2 / (dS * dS) - r;
 
-            float alpha = coef_pp - coef_p;   // coefficient of V[i-1]
-            float beta = coef_0;               // coefficient of V[i]
-            float gamma = coef_pp + coef_p;    // coefficient of V[i+1]
+            const float alpha = coef_pp - coef_p;
+            const float beta  = coef_0;
+            const float gamma = coef_pp + coef_p;
 
-            // LHS (implicit)
             a[i] = -theta * dt * alpha;
             b[i] = 1.0f - theta * dt * beta;
             c[i] = -theta * dt * gamma;
 
-            // RHS (explicit)
             rhs[i] = V[i] * (1.0f + (1.0f - theta) * dt * beta)
                    + V[i-1] * (1.0f - theta) * dt * alpha
                    + V[i+1] * (1.0f - theta) * dt * gamma;
@@ -212,57 +313,35 @@ __device__ float price_american_fd_div_cuda(
 
         // Lower boundary: S = 0
         {
-            a[0] = 0.0f;
-            b[0] = 1.0f;
-            c[0] = 0.0f;
-
-            float t_remaining = T - t;
-            if (is_call) {
-                rhs[0] = 0.0f;
-            } else {
-                // Put at S=0: worth K*exp(-r*(T-t))
-                rhs[0] = K * expf(-r * t_remaining);
-            }
+            a[0] = 0.0f; b[0] = 1.0f; c[0] = 0.0f;
+            const float df = (df_tT_sched != nullptr) ? df_tT_sched[n]
+                : df_t_T(t, T, rates_curve, rates_times, n_rates);
+            rhs[0] = is_call ? 0.0f : K * df;
         }
 
         // Upper boundary: S = S_max
         {
-            a[N_s] = 0.0f;
-            b[N_s] = 1.0f;
-            c[N_s] = 0.0f;
-
-            float t_remaining = T - t;
-            if (is_call) {
-                // Call at large S: V ≈ S - K*exp(-r*(T-t))
-                rhs[N_s] = S_grid[N_s] - K * expf(-r * t_remaining);
-            } else {
-                // Put at large S: worth approximately 0
-                rhs[N_s] = 0.0f;
-            }
+            a[N_s] = 0.0f; b[N_s] = 1.0f; c[N_s] = 0.0f;
+            const float df = (df_tT_sched != nullptr) ? df_tT_sched[n]
+                : df_t_T(t, T, rates_curve, rates_times, n_rates);
+            rhs[N_s] = is_call ? (S_grid[N_s] - K * df) : 0.0f;
         }
 
-        // Solve tridiagonal
         solve_tridiagonal_cuda(N_s + 1, a, b, c, rhs);
-        for (int i = 0; i <= N_s; ++i) {
-            V[i] = rhs[i];
-        }
+        for (int i = 0; i <= N_s; ++i) V[i] = rhs[i];
 
         // American early exercise at time t (before dividend)
         for (int i = 0; i <= N_s; ++i) {
-            float intrinsic = is_call
-                ? fmaxf(S_grid[i] - K, 0.0f)
-                : fmaxf(K - S_grid[i], 0.0f);
+            const float intrinsic = is_call ? fmaxf(S_grid[i] - K, 0.0f) : fmaxf(K - S_grid[i], 0.0f);
             V[i] = fmaxf(V[i], intrinsic);
         }
 
         // Apply dividend jumps
         for (int div_idx = 0; div_idx < n_div_events; ++div_idx) {
             if (div_events[div_idx].step == n) {
-                float V_new[MAX_SPACE_STEPS + 1];
-
                 for (int i = 0; i <= N_s; ++i) {
-                    float S_pre_div = S_grid[i];
-                    float S_post_div = S_pre_div - div_events[div_idx].amount;
+                    const float S_pre_div  = S_grid[i];
+                    const float S_post_div = S_pre_div - div_events[div_idx].amount;
 
                     if (S_post_div <= 0.0f) {
                         // Stock worthless after dividend
@@ -273,25 +352,20 @@ __device__ float price_american_fd_div_cuda(
                         V_new[i] = V[0];
                     } else {
                         // Linear interpolation
-                        float idx_f = (S_post_div - S_min) / dS;
+                        const float idx_f = (S_post_div - S_min) / dS;
                         int idx = static_cast<int>(floorf(idx_f));
                         if (idx < 0) idx = 0;
                         if (idx >= N_s) idx = N_s - 1;
-                        float w = idx_f - idx;
+                        const float w = idx_f - idx;
                         V_new[i] = (1.0f - w) * V[idx] + w * V[idx + 1];
                     }
                 }
-
                 // Copy back
-                for (int i = 0; i <= N_s; ++i) {
-                    V[i] = V_new[i];
-                }
+                for (int i = 0; i <= N_s; ++i) V[i] = V_new[i];
 
                 // Re-apply early exercise after dividend
                 for (int i = 0; i <= N_s; ++i) {
-                    float intrinsic = is_call
-                        ? fmaxf(S_grid[i] - K, 0.0f)
-                        : fmaxf(K - S_grid[i], 0.0f);
+                    const float intrinsic = is_call ? fmaxf(S_grid[i] - K, 0.0f) : fmaxf(K - S_grid[i], 0.0f);
                     V[i] = fmaxf(V[i], intrinsic);
                 }
             }
@@ -302,29 +376,31 @@ __device__ float price_american_fd_div_cuda(
     if (S <= S_min) return V[0];
     if (S >= S_max) return V[N_s];
 
-    float idx_f = (S - S_min) / dS;
+    const float idx_f = (S - S_min) / dS;
     int idx = static_cast<int>(floorf(idx_f));
     if (idx < 0) idx = 0;
     if (idx >= N_s) idx = N_s - 1;
-    float w = idx_f - idx;
+    const float w = idx_f - idx;
 
     return (1.0f - w) * V[idx] + w * V[idx + 1];
 }
 
 __device__ float implied_vol_american_fd_cuda(
-    float target, float S, float K, float T, uint8_t is_call,
+    const float target, const float S, const float K, const float T, const uint8_t is_call,
     const float* rates_curve,
     const float* rates_times,
-    int n_rates,
-    float pv_divs,
+    const int n_rates,
+    const float pv_divs,
     const DivEvent* div_events,
-    int n_div_events,
-    float tol         = 1e-6f,
-    int   max_iter    = 100,
-    float v_min       = 1e-4f,
-    float v_max       = 5.0f,
-    int   time_steps  = 200,
-    int   space_steps = 200)
+    const int n_div_events,
+    const float* r_sched,        // NEW
+    const float* df_tT_sched,     // NEW
+    const float tol         = 1e-6f,
+    const int   max_iter    = 100,
+    const float v_min       = 1e-4f,
+    const float v_max       = 5.0f,
+    const int   time_steps  = 200,
+    const int   space_steps = 200)
 {
     if (T <= 0.0f || S <= 0.0f || K <= 0.0f || target <= 0.0f)
         return 0.0f;
@@ -332,29 +408,26 @@ __device__ float implied_vol_american_fd_cuda(
     // Check if price is at intrinsic
     float intrinsic = is_call ? fmaxf(S - K, 0.0f) : fmaxf(K - S, 0.0f);
     if (fabsf(target - intrinsic) < 1e-6f) {
-        return 0.0f;
+        return v_min;
     }
 
     // Initial bracket check
-    float p_low = price_american_fd_div_cuda(
+    const float p_low = price_american_fd_cuda(
         S, K, T, v_min, is_call,
         rates_curve, rates_times, n_rates,
         pv_divs, div_events, n_div_events,
-        time_steps, space_steps);
+        time_steps, space_steps,
+        r_sched, df_tT_sched);
 
-    float p_high = price_american_fd_div_cuda(
+    const float p_high = price_american_fd_cuda(
         S, K, T, v_max, is_call,
         rates_curve, rates_times, n_rates,
         pv_divs, div_events, n_div_events,
-        time_steps, space_steps);
+        time_steps, space_steps,
+        r_sched, df_tT_sched);
 
-    // Target below minimum possible price
-    if (target <= p_low + 1e-9f)
-        return v_min;
-
-    // Target above maximum possible price
-    if (target >= p_high - 1e-9f)
-        return NAN;
+    if (target <= p_low + 1e-9f) return v_min;
+    if (target >= p_high - 1e-9f) return NAN;
 
     // Bisection with adaptive tolerance
     float lo = v_min;
@@ -362,98 +435,55 @@ __device__ float implied_vol_american_fd_cuda(
     float mid = 0.0f;
 
     // Use relative tolerance for better convergence
-    float rel_tol = tol / fmaxf(target, 1.0f);
+    const float rel_tol = tol / fmaxf(target, 1.0f);
 
     for (int i = 0; i < max_iter; ++i) {
         mid = 0.5f * (lo + hi);
 
-        float p_mid = price_american_fd_div_cuda(
+        const float p_mid = price_american_fd_cuda(
             S, K, T, mid, is_call,
             rates_curve, rates_times, n_rates,
             pv_divs, div_events, n_div_events,
-            time_steps, space_steps);
+            time_steps, space_steps,
+            r_sched, df_tT_sched);
 
-        float diff = p_mid - target;
-        float rel_diff = fabsf(diff) / target;
+        const float diff = p_mid - target;
+        const float rel_diff = fabsf(diff) / target;
 
         // Check convergence with both absolute and relative tolerance
-        if (fabsf(diff) < tol || rel_diff < rel_tol) {
-            return mid;
-        }
-
-        if (diff < 0.0f) {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
+        if (fabsf(diff) < tol || rel_diff < rel_tol) return mid;
+        if (diff < 0.0f) lo = mid;
+        else             hi = mid;
 
         // Check if bracket is tight enough
-        if (hi - lo < v_min * 0.01f) {
-            break;
-        }
+        if (hi - lo < v_min * 0.01f) break;
     }
 
     return mid;
 }
 
-// Kernel for FD pricing
-__global__ void compute_fd_price_kernel(
-    const float *spots, const float *strikes, const float *tenors, const float *sigmas,
-    const uint8_t *v_is_call, int n_options,
-    const float *rates_curve, const float *rates_times, int n_rates,
-    const float *div_amounts, const float *div_times, int n_divs,
-    float *out_price,
-    int time_steps = 200, int space_steps = 200) {
-
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n_options) return;
-
-    float s = spots[idx];
-    float k = strikes[idx];
-    float t = tenors[idx];
-    float sigma = sigmas[idx];
-    uint8_t is_call = v_is_call[idx];
-
-    if (!isfinite(s) || !isfinite(k) || !isfinite(t) || !isfinite(sigma) ||
-        t <= 0.0f || s <= 0.0f || k <= 0.0f || sigma <= 0.0f) {
-        out_price[idx] = NAN;
-        return;
-        }
-
-    // Precalculate PV of dividends and Dividend Events (Once per thread/option)
-    float pv_divs;
-    DivEvent div_events[MAX_DIV_EVENTS];
-    int n_div_events;
-
-    precompute_dividends_cuda(t, time_steps, rates_curve, rates_times, n_rates,
-                              div_amounts, div_times, n_divs,
-                              pv_divs, div_events, n_div_events);
-
-    out_price[idx] = price_american_fd_div_cuda(
-        s, k, t, sigma, is_call,
-        rates_curve, rates_times, n_rates,
-        pv_divs, div_events, n_div_events,
-        time_steps, space_steps);
-}
-
-// Kernel for FD IV calculation - refactored
 __global__ void compute_fd_iv_kernel(
     const float *prices, const float *spots, const float *strikes, const float *tenors,
     const uint8_t *v_is_call, int n_options,
-    const float *rates_curve, const float *rates_times, int n_rates,
-    const float *div_amounts, const float *div_times, int n_divs,
+    const int *tenor_ids,
+    const float *pv_divs_by_tenor,
+    const DivEvent *div_events_by_tenor,
+    const int *n_div_events_by_tenor,
+    const float *r_by_tenor,           // NEW: size n_unique * RATE_SCHED_STRIDE
+    const float *df_tT_by_tenor,       // NEW: size n_unique * RATE_SCHED_STRIDE
+    const float *rates_curve, const float *rates_times, const int n_rates,
     float *results,
-    float tol, int max_iter, float v_min, float v_max,
-    int time_steps, int space_steps) {
+    const float tol, const int max_iter, const float v_min, const float v_max,
+    const int time_steps, const int space_steps) {
 
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n_options) return;
 
-    float p = prices[idx];
-    float s = spots[idx];
-    float k = strikes[idx];
-    float t = tenors[idx];
-    uint8_t is_call = v_is_call[idx];
+    const float p = prices[idx];
+    const float s = spots[idx];
+    const float k = strikes[idx];
+    const float t = tenors[idx];
+    const uint8_t is_call = v_is_call[idx];
 
     // Input validation
     if (!isfinite(p) || !isfinite(s) || !isfinite(k) || !isfinite(t)) {
@@ -467,310 +497,59 @@ __global__ void compute_fd_iv_kernel(
     }
 
     // Check intrinsic value
-    float intrinsic = is_call ? fmaxf(s - k, 0.0f) : fmaxf(k - s, 0.0f);
+    const float intrinsic = is_call ? fmaxf(s - k, 0.0f) : fmaxf(k - s, 0.0f);
     if (fabsf(p - intrinsic) < 1e-6f) {
-        results[idx] = 0.0f;
+        results[idx] = v_min;
         return;
     }
 
     // Check if price is reasonable (not below intrinsic)
     if (p < intrinsic - 1e-6f) {
-        results[idx] = NAN;
+        results[idx] = v_min;
         return;
     }
 
-    // Precalculate PV of dividends and Dividend Events (Once per thread/option)
-    float pv_divs;
-    DivEvent div_events[MAX_DIV_EVENTS];
-    int n_div_events;
+    int tid = tenor_ids[idx];
+    float pv_divs = pv_divs_by_tenor[tid];
+    const DivEvent* div_events = div_events_by_tenor + tid * MAX_DIV_EVENTS;
+    int n_div_events = n_div_events_by_tenor[tid];
 
-    precompute_dividends_cuda(t, time_steps, rates_curve, rates_times, n_rates,
-                              div_amounts, div_times, n_divs,
-                              pv_divs, div_events, n_div_events);
+    const float* r_sched = (r_by_tenor != nullptr) ? (r_by_tenor + tid * RATE_SCHED_STRIDE) : nullptr;
+    const float* df_sched = (df_tT_by_tenor != nullptr) ? (df_tT_by_tenor + tid * RATE_SCHED_STRIDE) : nullptr;
+
 
     results[idx] = implied_vol_american_fd_cuda(
         p, s, k, t, is_call,
         rates_curve, rates_times, n_rates,
         pv_divs, div_events, n_div_events,
+        r_sched, df_sched,
         tol, max_iter, v_min, v_max,
         time_steps, space_steps);
 }
 
-__device__ float price_american_binomial_cash_div_threadlocal(
-    float S, float K, float T,
-    float sigma, uint8_t is_call, int n_steps,
-    const float *rates_curve, const float *rates_times, int n_rates,
-    const float *div_amounts, const int *div_steps, int n_divs) {
-    constexpr int MAX_STEPS = 512;
-    float V[MAX_STEPS + 1];
-
-    // Defensive bound for exponent
-    if (n_steps > MAX_STEPS) n_steps = MAX_STEPS;
-
-    // Scaling time steps for short T
-    int effective_steps = n_steps;
-    if (T < 0.1f) {
-        effective_steps = (int)(T * n_steps * 10);
-        if (effective_steps > n_steps) effective_steps = n_steps;
-        if (effective_steps < 10)       effective_steps = 10;
-    }
-    if (effective_steps > MAX_STEPS) effective_steps = MAX_STEPS;
-    float dt = T / effective_steps;
-
-    if (dt <= 0.0f) {
-        return is_call ? fmaxf(S - K, 0.0f) : fmaxf(K - S, 0.0f);
-    }
-    if (dt < 1e-6f) {
-        return is_call ? fmaxf(S - K, 0.0f) : fmaxf(K - S, 0.0f);
-    }
-
-    // Standard CRR multipliers (no escrowing)
-    float u = expf(sigma * sqrtf(dt));
-    if (u <= 1.001f) u = 1.001f;  // numerical safety
-    float d = 1.0f / u;
-    int   N = effective_steps;
-
-    // 1. Terminal payoffs with cash dividends applied along each path
-    float u2      = u * u;
-    float curr_S  = S * powf(d, N);  // bottom node (all downs)
-
-    for (int j = 0; j <= N; ++j) {
-        // Start from tree stock at (N, j) ignoring dividends
-        float S_j = curr_S;
-
-        // Apply each dividend along this path:
-        // dividend at step k reduces S by D_k * u^(ups_after_k) * d^(downs_after_k)
-        if (n_divs > 0) {
-            for (int div_i = 0; div_i < n_divs; ++div_i) {
-                int step_div = div_steps[div_i];
-                if (step_div > 0 && step_div <= N) {
-                    // Ups/downs before the dividend on this path
-                    int ups_before_div   = (step_div <= j) ? step_div : j;
-                    int downs_before_div = step_div - ups_before_div;
-
-                    int ups_after_div   = j - ups_before_div;
-                    int downs_after_div = (N - j) - downs_before_div;
-
-                    float mult_after = powf(u, ups_after_div) * powf(d, downs_after_div);
-                    S_j -= div_amounts[div_i] * mult_after;
-                    if (S_j < 1e-8f) S_j = 1e-8f;
-                }
-            }
-        }
-
-        V[j] = is_call ? fmaxf(S_j - K, 0.0f) : fmaxf(K - S_j, 0.0f);
-        curr_S *= u2;  // move to next node: replace one d with one u
-    }
-
-    // 2. Backward induction with term structure and discrete dividends
-    for (int step = N - 1; step >= 0; --step) {
-        float t_curr = step * dt;
-        float r      = get_rate_at_time(t_curr, rates_curve, rates_times, n_rates);
-        float disc   = expf(-r * dt);
-        float edtr   = expf(r * dt);
-        float p      = (edtr - d) / (u - d);
-        // clamp to [0,1] to avoid explosions
-        p = fmaxf(0.0f, fminf(1.0f, p));
-
-        for (int j = 0; j <= step; ++j) {
-            float cont = disc * (p * V[j + 1] + (1.0f - p) * V[j]);
-
-            // Rebuild stock at node (step, j) ignoring dividends
-            float S_j = S * powf(u, j) * powf(d, step - j);
-
-            // Apply all dividends that have occurred up to and including this step
-            if (n_divs > 0) {
-                for (int div_i = 0; div_i < n_divs; ++div_i) {
-                    int step_div = div_steps[div_i];
-                    if (step_div <= step && step_div > 0) {
-                        int ups_before_div   = (step_div <= j) ? step_div : j;
-                        int downs_before_div = step_div - ups_before_div;
-
-                        int ups_after_div   = j - ups_before_div;
-                        int downs_after_div = (step - j) - downs_before_div;
-
-                        float mult_after = powf(u, ups_after_div) * powf(d, downs_after_div);
-                        S_j -= div_amounts[div_i] * mult_after;
-                        if (S_j < 1e-8f) S_j = 1e-8f;
-                    }
-                }
-            }
-
-            float ex = is_call ? fmaxf(S_j - K, 0.0f) : fmaxf(K - S_j, 0.0f);
-            V[j] = fmaxf(cont, ex);
-        }
-    }
-    return V[0];
-}
-
-__device__ float implied_vol_american_bisection_threadlocal(
-    float target, float S, float K, float T, uint8_t is_call, int n_steps,
-    const float *rates_curve, const float *rates_times, int n_rates,
-    const float *div_amounts, const int *div_steps, int n_divs,
-    float tol = 1e-6f, int max_iter = 100, float v_min = 1e-4f, float v_max = 5.0f) {
-    float p_low = price_american_binomial_cash_div_threadlocal(S, K, T, v_min, is_call, n_steps, rates_curve,
-                                                               rates_times, n_rates, div_amounts, div_steps, n_divs);
-    float p_high = price_american_binomial_cash_div_threadlocal(S, K, T, v_max, is_call, n_steps, rates_curve,
-                                                                rates_times, n_rates, div_amounts, div_steps, n_divs);
-    if (target <= p_low + 1e-12f) return 0.0f;
-    if (target > p_high + 1e-12f) return NAN;
-
-    float lo = v_min, hi = v_max, mid = 0.0f;
-    for (int i = 0; i < max_iter; ++i) {
-        mid = 0.5f * (lo + hi);
-        float p_mid = price_american_binomial_cash_div_threadlocal(S, K, T, mid, is_call, n_steps, rates_curve,
-                                                                   rates_times, n_rates, div_amounts, div_steps,
-                                                                   n_divs);
-        float diff = p_mid - target;
-        if (fabsf(diff) < tol) return mid;
-        if (diff < 0.0f) lo = mid;
-        else hi = mid;
-        if (hi - lo < tol) break;
-    }
-    return mid;
-}
-
-__device__ float american_binomial_delta_fd(
-    float S, float K, float T, float sigma, uint8_t is_call, int n_steps,
-    const float *rates_curve, const float *rates_times, int n_rates,
-    const float *div_amounts, const int *div_steps, int n_divs,
-    float rel_shift = 1e-4f) {
-    float h = S * rel_shift;
-    if (h < 1e-6f) h = 1e-6f;
-    float up = price_american_binomial_cash_div_threadlocal(
-        S + h, K, T, sigma, is_call, n_steps, rates_curve, rates_times, n_rates, div_amounts, div_steps, n_divs);
-    float down = price_american_binomial_cash_div_threadlocal(
-        S - h, K, T, sigma, is_call, n_steps, rates_curve, rates_times, n_rates, div_amounts, div_steps, n_divs);
-    return (up - down) / (2.0f * h);
-}
-
-__device__ float american_binomial_vega_fd(
-    float S, float K, float T, float sigma, uint8_t is_call, int n_steps,
-    const float *rates_curve, const float *rates_times, int n_rates,
-    const float *div_amounts, const int *div_steps, int n_divs,
-    float abs_shift = 1e-4f) {
-    float h = fmaxf(abs_shift, sigma * 1e-2f); // Robust shift for high vols
-    float up = price_american_binomial_cash_div_threadlocal(
-        S, K, T, sigma + h, is_call, n_steps, rates_curve, rates_times, n_rates, div_amounts, div_steps, n_divs);
-    float down = price_american_binomial_cash_div_threadlocal(
-        S, K, T, sigma - h, is_call, n_steps, rates_curve, rates_times, n_rates, div_amounts, div_steps, n_divs);
-    return (up - down) / (2.0f * h);
-}
-
-// =======================
-// Main IV kernel: no shared memory needed
-// =======================
-
-__global__ void compute_iv_kernel_threadlocal(
-    const float *prices, const float *spots, const float *strikes, const float *tenors,
-    const uint8_t *v_is_call, const float *rates_curve, const float *rates_times, int n_rates,
+__global__ void compute_fd_delta_kernel(
+    const float* spots, const float* strikes, const float* tenors, const float* sigmas,
+    const uint8_t* rights,
+    const int* tenor_ids,
+    const float* pv_divs_by_tenor,
+    const DivEvent* div_events_by_tenor,
+    const int* n_div_events_by_tenor,
+    const float* r_by_tenor,
+    const float* df_tT_by_tenor,
+    const float* rates_curve, const float* rates_times, int n_rates,
+    int time_steps, int space_steps,
     int n_options,
-    const float *div_amounts, const float *div_times, int n_divs,
-    float *results,
-    float tol = 1e-6f, int max_iter = 100, float v_min = 1e-4f, float v_max = 5.0f, float steps_factor = 1.0f) {
-    int n_steps = 200 * steps_factor;
-
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    float rel_shift,           // e.g. 1e-4
+    float* out_delta)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n_options) return;
 
-    float p = prices[idx];
-    float s = spots[idx];
-    float k = strikes[idx];
-    float t = tenors[idx];
-    uint8_t is_call = v_is_call[idx];
-
-    if (!isfinite(p) || !isfinite(s) || !isfinite(k) || !isfinite(t) ||
-        t <= 0.0f || s <= 0.0f || k <= 0.0f || p <= 0.0f) {
-        results[idx] = (t <= 0.0f) ? 0.0f : NAN;
-        return;
-    }
-
-    // Only include dividends before expiry
-    const int MAX_DIVS = 32;
-    float local_div_amounts[MAX_DIVS];
-    int local_div_steps[MAX_DIVS];
-    int valid_divs = 0;
-
-    float intrinsic = is_call ? max(s - k, 0.0f) : max(k - s, 0.0f);
-    if (fabs(p - intrinsic) < 1e-6f) {
-        results[idx] = 0.0f;
-        return;
-    }
-
-    for (int j = 0; j < n_divs && j < MAX_DIVS; ++j) {
-        float div_time = div_times[j];
-        if (div_time > 0.0f && div_time < t) {
-            int step = (int) roundf(div_time / t * n_steps);
-            step = max(1, min(step, n_steps));
-            local_div_steps[valid_divs] = step;
-            local_div_amounts[valid_divs] = div_amounts[j];
-            valid_divs++;
-        }
-    }
-
-    results[idx] = implied_vol_american_bisection_threadlocal(
-        p, s, k, t, is_call, n_steps,
-        rates_curve, rates_times, n_rates,
-        local_div_amounts, local_div_steps, valid_divs,
-        tol, max_iter, v_min, v_max
-    );
-}
-
-__global__ void compute_price_kernel_threadlocal(
-    const float *spots, const float *strikes, const float *tenors, const float *sigmas,
-    const uint8_t *rights,
-    const float *rates_curve, const float *rates_times, int n_rates,
-    const float *div_amounts, const float *div_times, int n_divs,
-    int time_steps,
-    int space_steps,
-    int n_options,
-    float *out_price) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n_options) return;
-
-    float s = spots[idx];
-    float k = strikes[idx];
-    float t = tenors[idx];
-    float sigma = sigmas[idx];
-    int right = rights[idx];
-
-    if (!isfinite(s) || !isfinite(k) || !isfinite(t) || !isfinite(sigma) ||
-        t <= 0.0f || s <= 0.0f || k <= 0.0f || sigma <= 0.0f) {
-        out_price[idx] = NAN;
-        return;
-    }
-
-    // Precalculate PV of dividends and Dividend Events (Once per thread/option)
-    float pv_divs;
-    DivEvent div_events[MAX_DIV_EVENTS];
-    int n_div_events;
-
-    precompute_dividends_cuda(t, time_steps, rates_curve, rates_times, n_rates,
-                              div_amounts, div_times, n_divs,
-                              pv_divs, div_events, n_div_events);
-
-    out_price[idx] = price_american_fd_div_cuda(
-        s, k, t, sigma, right,
-        rates_curve, rates_times, n_rates,
-        pv_divs, div_events, n_div_events,
-        time_steps, space_steps
-    );
-}
-
-__global__ void compute_delta_kernel_threadlocal(
-    const float *spots, const float *strikes, const float *tenors, const float *sigmas,
-    const int *rights, int n_steps, int n_options,
-    const float *rates_curve, const float *rates_times, int n_rates,
-    const float *div_amounts, const float *div_times, int n_divs,
-    float *out_delta) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n_options) return;
-
-    float s = spots[idx];
-    float k = strikes[idx];
-    float t = tenors[idx];
-    float sigma = sigmas[idx];
-    int right = rights[idx];
+    const float s = spots[idx];
+    const float k = strikes[idx];
+    const float t = tenors[idx];
+    const float sigma = sigmas[idx];
+    const uint8_t is_call = rights[idx];
 
     if (!isfinite(s) || !isfinite(k) || !isfinite(t) || !isfinite(sigma) ||
         t <= 0.0f || s <= 0.0f || k <= 0.0f || sigma <= 0.0f) {
@@ -778,42 +557,59 @@ __global__ void compute_delta_kernel_threadlocal(
         return;
     }
 
-    const int MAX_DIVS = 32;
-    float local_div_amounts[MAX_DIVS];
-    int local_div_steps[MAX_DIVS];
-    int valid_divs = 0;
-    for (int j = 0; j < n_divs && j < MAX_DIVS; ++j) {
-        float div_time = div_times[j];
-        if (div_time > 0.0f && div_time < t) {
-            int step = (int) roundf(div_time / t * n_steps);
-            step = max(1, min(step, n_steps));
-            local_div_steps[valid_divs] = step;
-            local_div_amounts[valid_divs] = div_amounts[j];
-            valid_divs++;
-        }
-    }
+    const int tid = tenor_ids[idx];
+    const float pv_divs = pv_divs_by_tenor[tid];
+    const DivEvent* div_events = div_events_by_tenor + tid * MAX_DIV_EVENTS;
+    const int n_div_events = n_div_events_by_tenor[tid];
 
-    out_delta[idx] = american_binomial_delta_fd(
-        s, k, t, sigma, right, n_steps,
+    const float* r_sched  = (r_by_tenor != nullptr)   ? (r_by_tenor + tid * RATE_SCHED_STRIDE) : nullptr;
+    const float* df_sched = (df_tT_by_tenor != nullptr) ? (df_tT_by_tenor + tid * RATE_SCHED_STRIDE) : nullptr;
+
+    float h = s * rel_shift;
+    if (h < 1e-6f) h = 1e-6f;
+
+    const float p_up = price_american_fd_cuda(
+        s + h, k, t, sigma, is_call,
         rates_curve, rates_times, n_rates,
-        local_div_amounts, local_div_steps, valid_divs
+        pv_divs, div_events, n_div_events,
+        time_steps, space_steps,
+        r_sched, df_sched
     );
+
+    const float p_dn = price_american_fd_cuda(
+        fmaxf(s - h, 1e-8f), k, t, sigma, is_call,
+        rates_curve, rates_times, n_rates,
+        pv_divs, div_events, n_div_events,
+        time_steps, space_steps,
+        r_sched, df_sched
+    );
+
+    out_delta[idx] = (p_up - p_dn) / (2.0f * h);
 }
 
-__global__ void compute_vega_kernel_threadlocal(
-    const float *spots, const float *strikes, const float *tenors, const float *sigmas,
-    const uint8_t *v_is_call, int n_steps, int n_options,
-    const float *rates_curve, const float *rates_times, int n_rates,
-    const float *div_amounts, const float *div_times, int n_divs,
-    float *out_vega) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+__global__ void compute_fd_vega_kernel(
+    const float* spots, const float* strikes, const float* tenors, const float* sigmas,
+    const uint8_t* rights,
+    const int* tenor_ids,
+    const float* pv_divs_by_tenor,
+    const DivEvent* div_events_by_tenor,
+    const int* n_div_events_by_tenor,
+    const float* r_by_tenor,
+    const float* df_tT_by_tenor,
+    const float* rates_curve, const float* rates_times, int n_rates,
+    int time_steps, int space_steps,
+    int n_options,
+    float abs_shift,           // e.g. 1e-4
+    float* out_vega)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n_options) return;
 
-    float s = spots[idx];
-    float k = strikes[idx];
-    float t = tenors[idx];
-    float sigma = sigmas[idx];
-    uint8_t is_call = v_is_call[idx];
+    const float s = spots[idx];
+    const float k = strikes[idx];
+    const float t = tenors[idx];
+    const float sigma = sigmas[idx];
+    const uint8_t is_call = rights[idx];
 
     if (!isfinite(s) || !isfinite(k) || !isfinite(t) || !isfinite(sigma) ||
         t <= 0.0f || s <= 0.0f || k <= 0.0f || sigma <= 0.0f) {
@@ -821,34 +617,274 @@ __global__ void compute_vega_kernel_threadlocal(
         return;
     }
 
-    const int MAX_DIVS = 32;
-    float local_div_amounts[MAX_DIVS];
-    int local_div_steps[MAX_DIVS];
-    int valid_divs = 0;
-    for (int j = 0; j < n_divs && j < MAX_DIVS; ++j) {
-        float div_time = div_times[j];
-        if (div_time > 0.0f && div_time < t) {
-            int step = (int) roundf(div_time / t * n_steps);
-            step = max(1, min(step, n_steps));
-            local_div_steps[valid_divs] = step;
-            local_div_amounts[valid_divs] = div_amounts[j];
-            valid_divs++;
-        }
-    }
+    const int tid = tenor_ids[idx];
+    const float pv_divs = pv_divs_by_tenor[tid];
+    const DivEvent* div_events = div_events_by_tenor + tid * MAX_DIV_EVENTS;
+    const int n_div_events = n_div_events_by_tenor[tid];
 
-    out_vega[idx] = american_binomial_vega_fd(
-        s, k, t, sigma, is_call, n_steps,
+    const float* r_sched  = (r_by_tenor != nullptr)   ? (r_by_tenor + tid * RATE_SCHED_STRIDE) : nullptr;
+    const float* df_sched = (df_tT_by_tenor != nullptr) ? (df_tT_by_tenor + tid * RATE_SCHED_STRIDE) : nullptr;
+
+    float h = fmaxf(abs_shift, sigma * 1e-2f); // robust shift for large vols
+
+    const float p_up = price_american_fd_cuda(
+        s, k, t, sigma + h, is_call,
         rates_curve, rates_times, n_rates,
-        local_div_amounts, local_div_steps, valid_divs
+        pv_divs, div_events, n_div_events,
+        time_steps, space_steps,
+        r_sched, df_sched
+    );
+
+    const float sigma_dn = fmaxf(sigma - h, 1e-6f);
+    const float p_dn = price_american_fd_cuda(
+        s, k, t, sigma_dn, is_call,
+        rates_curve, rates_times, n_rates,
+        pv_divs, div_events, n_div_events,
+        time_steps, space_steps,
+        r_sched, df_sched
+    );
+
+    out_vega[idx] = (p_up - p_dn) / (2.0f * h);
+}
+
+// =======================
+// Main IV kernel: no shared memory needed
+// =======================
+
+__global__ void compute_price_kernel_threadlocal(
+    const float *spots, const float *strikes, const float *tenors, const float *sigmas,
+    const uint8_t *rights,
+    const int *tenor_ids,
+    const float *pv_divs_by_tenor,
+    const DivEvent *div_events_by_tenor,
+    const int *n_div_events_by_tenor,
+    const float *r_by_tenor,           // NEW: size n_unique * RATE_SCHED_STRIDE
+    const float *df_tT_by_tenor,       // NEW: size n_unique * RATE_SCHED_STRIDE
+    const float *rates_curve, const float *rates_times, int n_rates,
+    const int time_steps,
+    const int space_steps,
+    const int n_options,
+    float *out_price)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_options) return;
+
+    const float s = spots[idx];
+    const float k = strikes[idx];
+    const float t = tenors[idx];
+    const float sigma = sigmas[idx];
+    const int right = rights[idx];
+
+    if (!isfinite(s) || !isfinite(k) || !isfinite(t) || !isfinite(sigma) ||
+        t <= 0.0f || s <= 0.0f || k <= 0.0f || sigma <= 0.0f) {
+        if (t <= 0.0f || s <= 0.0f || k <= 0.0f || sigma <= 0.0f)
+            out_price[idx] = right == 1 ? std::fmax(s - k, 0.0f) : std::fmax(k - s, 0.0f);
+        return;
+        }
+
+    const int tid = tenor_ids[idx];
+    const float pv_divs = pv_divs_by_tenor[tid];
+    const DivEvent* div_events = div_events_by_tenor + tid * MAX_DIV_EVENTS;
+    const int n_div_events = n_div_events_by_tenor[tid];
+
+    const float* r_sched = (r_by_tenor != nullptr) ? (r_by_tenor + tid * RATE_SCHED_STRIDE) : nullptr;
+    const float* df_sched = (df_tT_by_tenor != nullptr) ? (df_tT_by_tenor + tid * RATE_SCHED_STRIDE) : nullptr;
+
+    out_price[idx] = price_american_fd_cuda(
+        s, k, t, sigma, right,
+        rates_curve, rates_times, n_rates,
+        pv_divs, div_events, n_div_events,
+        time_steps, space_steps,
+        r_sched, df_sched
     );
 }
+
 
 /////////////////////////////////////////////////////////
 /// Host / CPU wrappers that launch kernels
 /////////////////////////////////////////////////////////
 
-// Host wrapper for FD IV calculation on GPU - refactored for accuracy
-std::vector<float> get_v_iv_fd_cuda_new(
+__global__ void build_rates_schedule_kernel(
+    const float* unique_tenors, int n_unique,
+    int time_steps,
+    const float* rates_curve, const float* rates_times, int n_rates,
+    float* out_r_by_tenor,     // size n_unique * RATE_SCHED_STRIDE
+    float* out_df_tT_by_tenor) // size n_unique * RATE_SCHED_STRIDE
+{
+    const int tid = blockIdx.x;
+    const int n   = threadIdx.x;
+
+    if (tid >= n_unique) return;
+    if (n >= RATE_SCHED_STRIDE) return;
+
+    const float T = unique_tenors[tid];
+
+    // Mirror FD clamping behavior
+    int N_t = time_steps;
+    if (N_t < 10) N_t = 10;
+    if (N_t > MAX_TIME_STEPS_SCHED) N_t = MAX_TIME_STEPS_SCHED;
+
+    const float dt = (T > 0.0f) ? (T / static_cast<float>(N_t)) : 0.0f;
+
+    // Only fill valid indices; pad the rest with terminal values so accidental reads are benign.
+    const int max_n = N_t; // inclusive, we store 0..N_t
+    float r = 0.0f;
+    float df = 1.0f;
+
+    if (n <= max_n && T > 0.0f && n_rates > 0) {
+        const float t = static_cast<float>(n) * dt;
+        r  = get_rate_at_time_convex_monotone(t, rates_curve, rates_times, n_rates);
+        df = df_t_T(t, T, rates_curve, rates_times, n_rates);
+    } else if (n > max_n && T > 0.0f && n_rates > 0) {
+        // Pad with values at maturity t=T
+        r  = get_rate_at_time_convex_monotone(T, rates_curve, rates_times, n_rates);
+        df = 1.0f; // D(T,T)
+    } else {
+        r  = 0.0f;
+        df = 1.0f;
+    }
+
+    out_r_by_tenor[tid * RATE_SCHED_STRIDE + n] = r;
+    out_df_tT_by_tenor[tid * RATE_SCHED_STRIDE + n] = df;
+}
+
+
+static float get_rate_at_time_host(
+    const float t, const std::vector<float>& rates_curve, const std::vector<float>& rates_times)
+{
+    const int n_points = static_cast<int>(rates_curve.size());
+    if (n_points <= 0) return 0.0f;
+    if (t <= rates_times[0]) return rates_curve[0];
+    if (t >= rates_times[n_points - 1]) return rates_curve[n_points - 1];
+
+    for (int i = 0; i < n_points - 1; ++i) {
+        if (t <= rates_times[i + 1]) {
+            const float t_low = rates_times[i];
+            const float t_high = rates_times[i + 1];
+            const float r_low = rates_curve[i];
+            const float r_high = rates_curve[i + 1];
+            return (r_high * t_high - r_low * t_low) / (t_high - t_low);
+        }
+    }
+    return rates_curve[n_points - 1];
+}
+
+static void precompute_dividends_host(
+    const float T, const int time_steps,
+    const std::vector<float>& rates_curve, const std::vector<float>& rates_times,
+    const std::vector<float>& div_amounts, const std::vector<float>& div_times,
+    float& out_pv_divs,
+    DivEvent* out_div_events,
+    int& out_n_div_events,
+    const float div_scale = 1.0f)
+{
+    out_pv_divs = 0.0f;
+    out_n_div_events = 0;
+
+    const int n_divs = static_cast<int>(div_amounts.size());
+
+    for (int i = 0; i < n_divs; ++i) {
+        const float t_div = div_times[i];
+        if (t_div > 0.0f && t_div <= T) {
+            const float r_div = get_rate_at_time_host(t_div, rates_curve, rates_times);
+            out_pv_divs += div_amounts[i] * div_scale * std::exp(-r_div * t_div);
+        }
+    }
+
+    float dt = T / static_cast<float>(time_steps);
+    for (int k = 0; k < n_divs && out_n_div_events < MAX_DIV_EVENTS; ++k) {
+        float tD = div_times[k];
+        if (tD > 0.0f && tD < T) {
+            int step = static_cast<int>(std::floor(tD / dt));
+            if (step < 0) step = 0;
+            if (step >= time_steps) step = time_steps - 1;
+            out_div_events[out_n_div_events++] = {step, div_amounts[k] * div_scale, tD};
+        }
+    }
+}
+
+struct TenorDividendScheduleHost {
+    std::vector<int> tenor_ids;                 // size n_options
+    std::vector<float> unique_tenors;           // size n_unique
+    std::vector<float> pv_divs_by_tenor;        // size n_unique
+    std::vector<int> n_div_events_by_tenor;     // size n_unique
+    std::vector<DivEvent> div_events_by_tenor;  // size n_unique * MAX_DIV_EVENTS
+};
+
+static TenorDividendScheduleHost build_tenor_dividend_schedule_host(
+    const std::vector<float>& tenors,
+    const int time_steps,
+    const std::vector<float>& rates_curve,
+    const std::vector<float>& rates_times,
+    const std::vector<float>& div_amounts,
+    const std::vector<float>& div_times,
+    const float S_ref = 1.0f)
+{
+    TenorDividendScheduleHost out;
+
+    const int n_options = static_cast<int>(tenors.size());
+
+    // Bucket tenors by day to avoid exploding unique tenor count after switching to datetime-based tenors.
+    // We map each tenor T (in years) to an integer day bucket: day = round(T * 365).
+    // Then we store the representative unique tenor as day / 365.
+    constexpr float DAYS_PER_YEAR = 365.0f;
+
+    std::unordered_map<int, int> day_to_id;
+    day_to_id.reserve(64);
+
+    out.unique_tenors.reserve(64);
+    out.tenor_ids.assign(n_options, 0);
+
+    for (int i = 0; i < n_options; ++i) {
+        const float T = tenors[i];
+
+        // Handle non-finite / negative tenors deterministically (they shouldn't appear in pricing anyway).
+        const int day_bucket = (std::isfinite(T) && T > 0.0f)
+            ? static_cast<int>(std::lround(T * DAYS_PER_YEAR))
+            : 0;
+
+        auto it = day_to_id.find(day_bucket);
+        if (it == day_to_id.end()) {
+            const int new_id = static_cast<int>(out.unique_tenors.size());
+            const float T_bucket = static_cast<float>(day_bucket) / DAYS_PER_YEAR;
+
+            out.unique_tenors.push_back(T_bucket);
+            day_to_id.emplace(day_bucket, new_id);
+            out.tenor_ids[i] = new_id;
+        } else {
+            out.tenor_ids[i] = it->second;
+        }
+    }
+
+    const int n_unique = static_cast<int>(out.unique_tenors.size());
+    out.pv_divs_by_tenor.assign(n_unique, 0.0f);
+    out.n_div_events_by_tenor.assign(n_unique, 0);
+    out.div_events_by_tenor.resize(static_cast<size_t>(n_unique) * MAX_DIV_EVENTS);
+
+    const float div_scale = (std::isfinite(S_ref) && S_ref > 0.0f) ? (1.0f / S_ref) : 1.0f;
+
+    for (int tid = 0; tid < n_unique; ++tid) {
+        float pv = 0.0f;
+        int n_ev = 0;
+        DivEvent* ev = out.div_events_by_tenor.data() + tid * MAX_DIV_EVENTS;
+
+        precompute_dividends_host(
+            out.unique_tenors[tid], time_steps,
+            rates_curve, rates_times,
+            div_amounts, div_times,
+            pv, ev, n_ev,
+            div_scale
+        );
+
+        out.pv_divs_by_tenor[tid] = pv;
+        out.n_div_events_by_tenor[tid] = n_ev;
+    }
+
+    return out;
+}
+
+
+std::vector<float> get_v_iv_fd_cuda(
     const std::vector<float> &prices,
     const std::vector<float> &spots,
     const std::vector<float> &strikes,
@@ -865,8 +901,8 @@ std::vector<float> get_v_iv_fd_cuda_new(
     const int time_steps,
     const int space_steps
 ) {
-    int n_options = prices.size();
-    std::vector<float> results(n_options, std::numeric_limits<float>::quiet_NaN());
+    const int n_options = prices.size();
+    std::vector results(n_options, std::numeric_limits<float>::quiet_NaN());
 
     if (n_options == 0) return results;
 
@@ -876,8 +912,13 @@ std::vector<float> get_v_iv_fd_cuda_new(
         return results;
     }
 
-    int n_divs = div_amounts.size();
-    int n_rates = rates_curve.size();
+    const int n_rates = rates_curve.size();
+
+    // Precompute per-tenor dividend schedules on host (only ~20 tenors expected)
+    const TenorDividendScheduleHost sched = build_tenor_dividend_schedule_host(
+        tenors, time_steps, rates_curve, rates_times, div_amounts, div_times
+    );
+    const int n_unique = static_cast<int>(sched.unique_tenors.size());
 
     // Validate rate and dividend data
     if (!rates_curve.empty() && rates_curve.size() != rates_times.size()) {
@@ -889,8 +930,18 @@ std::vector<float> get_v_iv_fd_cuda_new(
 
     float *d_prices, *d_spots, *d_strikes, *d_tenors, *d_results;
     uint8_t *d_v_is_call;
-    float *d_div_amounts = nullptr, *d_div_times = nullptr;
+
+    int *d_tenor_ids = nullptr;
+    float *d_pv_divs_by_tenor = nullptr;
+    DivEvent *d_div_events_by_tenor = nullptr;
+    int *d_n_div_events_by_tenor = nullptr;
+
     float *d_rates_curve = nullptr, *d_rates_times = nullptr;
+
+    // NEW: per-tenor rate schedules
+    float *d_unique_tenors = nullptr;
+    float *d_r_by_tenor = nullptr;
+    float *d_df_tT_by_tenor = nullptr;
 
     cudaMalloc(&d_prices, n_options * sizeof(float));
     cudaMalloc(&d_spots, n_options * sizeof(float));
@@ -905,12 +956,17 @@ std::vector<float> get_v_iv_fd_cuda_new(
     cudaMemcpy(d_tenors, tenors.data(), n_options * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_v_is_call, v_is_call.data(), n_options * sizeof(uint8_t), cudaMemcpyHostToDevice);
 
-    if (n_divs > 0) {
-        cudaMalloc(&d_div_amounts, n_divs * sizeof(float));
-        cudaMalloc(&d_div_times, n_divs * sizeof(float));
-        cudaMemcpy(d_div_amounts, div_amounts.data(), n_divs * sizeof(float), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_div_times, div_times.data(), n_divs * sizeof(float), cudaMemcpyHostToDevice);
-    }
+    cudaMalloc(&d_tenor_ids, n_options * sizeof(int));
+    cudaMemcpy(d_tenor_ids, sched.tenor_ids.data(), n_options * sizeof(int), cudaMemcpyHostToDevice);
+
+    cudaMalloc(&d_pv_divs_by_tenor, n_unique * sizeof(float));
+    cudaMalloc(&d_n_div_events_by_tenor, n_unique * sizeof(int));
+    cudaMalloc(&d_div_events_by_tenor, static_cast<size_t>(n_unique) * MAX_DIV_EVENTS * sizeof(DivEvent));
+
+    cudaMemcpy(d_pv_divs_by_tenor, sched.pv_divs_by_tenor.data(), n_unique * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_n_div_events_by_tenor, sched.n_div_events_by_tenor.data(), n_unique * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_div_events_by_tenor, sched.div_events_by_tenor.data(),
+               static_cast<size_t>(n_unique) * MAX_DIV_EVENTS * sizeof(DivEvent), cudaMemcpyHostToDevice);
 
     if (n_rates > 0) {
         cudaMalloc(&d_rates_curve, n_rates * sizeof(float));
@@ -919,13 +975,37 @@ std::vector<float> get_v_iv_fd_cuda_new(
         cudaMemcpy(d_rates_times, rates_times.data(), n_rates * sizeof(float), cudaMemcpyHostToDevice);
     }
 
+    // NEW: build per-tenor rate/discount schedules on device
+    if (n_unique > 0) {
+        cudaMalloc(&d_unique_tenors, n_unique * sizeof(float));
+        cudaMemcpy(d_unique_tenors, sched.unique_tenors.data(), n_unique * sizeof(float), cudaMemcpyHostToDevice);
+
+        cudaMalloc(&d_r_by_tenor, static_cast<size_t>(n_unique) * RATE_SCHED_STRIDE * sizeof(float));
+        cudaMalloc(&d_df_tT_by_tenor, static_cast<size_t>(n_unique) * RATE_SCHED_STRIDE * sizeof(float));
+
+        // One block per tenor, 257 threads to fill [0..256]
+        build_rates_schedule_kernel<<<n_unique, RATE_SCHED_STRIDE>>>(
+            d_unique_tenors, n_unique,
+            time_steps,
+            d_rates_curve, d_rates_times, n_rates,
+            d_r_by_tenor,
+            d_df_tT_by_tenor
+        );
+    }
+
     int block_size = 256;
     int grid_size = (n_options + block_size - 1) / block_size;
 
     compute_fd_iv_kernel<<<grid_size, block_size>>>(
         d_prices, d_spots, d_strikes, d_tenors, d_v_is_call, n_options,
+        d_tenor_ids,
+        d_pv_divs_by_tenor,
+        d_div_events_by_tenor,
+        d_n_div_events_by_tenor,
+        d_r_by_tenor,
+        d_df_tT_by_tenor,
         d_rates_curve, d_rates_times, n_rates,
-        d_div_amounts, d_div_times, n_divs, d_results,
+        d_results,
         tol, max_iter, v_min, v_max, time_steps, space_steps
     );
 
@@ -937,8 +1017,6 @@ std::vector<float> get_v_iv_fd_cuda_new(
         cudaFree(d_tenors);
         cudaFree(d_v_is_call);
         cudaFree(d_results);
-        if (d_div_amounts) cudaFree(d_div_amounts);
-        if (d_div_times) cudaFree(d_div_times);
         if (d_rates_curve) cudaFree(d_rates_curve);
         if (d_rates_times) cudaFree(d_rates_times);
         throw std::runtime_error("CUDA kernel launch failed: " + std::string(cudaGetErrorString(err)));
@@ -954,15 +1032,24 @@ std::vector<float> get_v_iv_fd_cuda_new(
     cudaFree(d_tenors);
     cudaFree(d_v_is_call);
     cudaFree(d_results);
-    if (d_div_amounts) cudaFree(d_div_amounts);
-    if (d_div_times) cudaFree(d_div_times);
+
+    cudaFree(d_tenor_ids);
+    cudaFree(d_pv_divs_by_tenor);
+    cudaFree(d_div_events_by_tenor);
+    cudaFree(d_n_div_events_by_tenor);
+
+    // NEW: free schedules
+    if (d_unique_tenors) cudaFree(d_unique_tenors);
+    if (d_r_by_tenor) cudaFree(d_r_by_tenor);
+    if (d_df_tT_by_tenor) cudaFree(d_df_tT_by_tenor);
+
     if (d_rates_curve) cudaFree(d_rates_curve);
     if (d_rates_times) cudaFree(d_rates_times);
 
     return results;
 }
 
-std::vector<float> get_v_fd_price_cuda(
+std::vector<float> get_v_price_fd_cuda(
     const std::vector<float> &spots,
     const std::vector<float> &strikes,
     const std::vector<float> &tenors,
@@ -975,19 +1062,34 @@ std::vector<float> get_v_fd_price_cuda(
     const int time_steps,
     const int space_steps
 ) {
-    int n_options = spots.size();
+    const int n_options = spots.size();
     std::vector<float> prices(n_options);
 
     if (n_options == 0) return prices;
 
-    int n_divs = div_amounts.size();
-    int n_rates = rates_curve.size();
+    const int n_rates = rates_curve.size();
+
+    // Precompute per-tenor dividend schedules on host (only ~20 tenors expected)
+    TenorDividendScheduleHost sched = build_tenor_dividend_schedule_host(
+        tenors, time_steps, rates_curve, rates_times, div_amounts, div_times
+    );
+    const int n_unique = static_cast<int>(sched.unique_tenors.size());
 
     float *d_spots, *d_strikes, *d_tenors, *d_sigmas;
     uint8_t *d_v_is_call;
-    float *d_div_amounts = nullptr, *d_div_times = nullptr;
     float *d_prices;
+
+    int *d_tenor_ids = nullptr;
+    float *d_pv_divs_by_tenor = nullptr;
+    DivEvent *d_div_events_by_tenor = nullptr;
+    int *d_n_div_events_by_tenor = nullptr;
+
     float *d_rates_curve = nullptr, *d_rates_times = nullptr;
+
+    // NEW: per-tenor rate schedules
+    float *d_unique_tenors = nullptr;
+    float *d_r_by_tenor = nullptr;
+    float *d_df_tT_by_tenor = nullptr;
 
     cudaMalloc(&d_spots, n_options * sizeof(float));
     cudaMalloc(&d_strikes, n_options * sizeof(float));
@@ -1002,12 +1104,17 @@ std::vector<float> get_v_fd_price_cuda(
     cudaMemcpy(d_sigmas, sigmas.data(), n_options * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_v_is_call, v_is_call.data(), n_options * sizeof(uint8_t), cudaMemcpyHostToDevice);
 
-    if (n_divs > 0 && div_amounts.size() == div_times.size()) {
-        cudaMalloc(&d_div_amounts, n_divs * sizeof(float));
-        cudaMalloc(&d_div_times, n_divs * sizeof(float));
-        cudaMemcpy(d_div_amounts, div_amounts.data(), n_divs * sizeof(float), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_div_times, div_times.data(), n_divs * sizeof(float), cudaMemcpyHostToDevice);
-    }
+    cudaMalloc(&d_tenor_ids, n_options * sizeof(int));
+    cudaMemcpy(d_tenor_ids, sched.tenor_ids.data(), n_options * sizeof(int), cudaMemcpyHostToDevice);
+
+    cudaMalloc(&d_pv_divs_by_tenor, n_unique * sizeof(float));
+    cudaMalloc(&d_n_div_events_by_tenor, n_unique * sizeof(int));
+    cudaMalloc(&d_div_events_by_tenor, static_cast<size_t>(n_unique) * MAX_DIV_EVENTS * sizeof(DivEvent));
+
+    cudaMemcpy(d_pv_divs_by_tenor, sched.pv_divs_by_tenor.data(), n_unique * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_n_div_events_by_tenor, sched.n_div_events_by_tenor.data(), n_unique * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_div_events_by_tenor, sched.div_events_by_tenor.data(),
+               static_cast<size_t>(n_unique) * MAX_DIV_EVENTS * sizeof(DivEvent), cudaMemcpyHostToDevice);
 
     if (n_rates > 0 && rates_curve.size() == rates_times.size()) {
         cudaMalloc(&d_rates_curve, n_rates * sizeof(float));
@@ -1016,13 +1123,36 @@ std::vector<float> get_v_fd_price_cuda(
         cudaMemcpy(d_rates_times, rates_times.data(), n_rates * sizeof(float), cudaMemcpyHostToDevice);
     }
 
+    // NEW: build per-tenor rate/discount schedules on device
+    if (n_unique > 0) {
+        cudaMalloc(&d_unique_tenors, n_unique * sizeof(float));
+        cudaMemcpy(d_unique_tenors, sched.unique_tenors.data(), n_unique * sizeof(float), cudaMemcpyHostToDevice);
+
+        cudaMalloc(&d_r_by_tenor, static_cast<size_t>(n_unique) * RATE_SCHED_STRIDE * sizeof(float));
+        cudaMalloc(&d_df_tT_by_tenor, static_cast<size_t>(n_unique) * RATE_SCHED_STRIDE * sizeof(float));
+
+        // One block per tenor, 257 threads to fill [0..256]
+        build_rates_schedule_kernel<<<n_unique, RATE_SCHED_STRIDE>>>(
+            d_unique_tenors, n_unique,
+            time_steps,
+            d_rates_curve, d_rates_times, n_rates,
+            d_r_by_tenor,
+            d_df_tT_by_tenor
+        );
+    }
+
     int block_size = 256;
     int grid_size = (n_options + block_size - 1) / block_size;
 
     compute_price_kernel_threadlocal<<<grid_size, block_size>>>(
         d_spots, d_strikes, d_tenors, d_sigmas, d_v_is_call,
+        d_tenor_ids,
+        d_pv_divs_by_tenor,
+        d_div_events_by_tenor,
+        d_n_div_events_by_tenor,
+        d_r_by_tenor,
+        d_df_tT_by_tenor,
         d_rates_curve, d_rates_times, n_rates,
-        d_div_amounts, d_div_times, n_divs,
         time_steps, space_steps, n_options, d_prices
     );
     cudaError_t err = cudaGetLastError();
@@ -1037,8 +1167,17 @@ std::vector<float> get_v_fd_price_cuda(
     cudaFree(d_sigmas);
     cudaFree(d_v_is_call);
     cudaFree(d_prices);
-    if (d_div_amounts) cudaFree(d_div_amounts);
-    if (d_div_times) cudaFree(d_div_times);
+
+    cudaFree(d_tenor_ids);
+    cudaFree(d_pv_divs_by_tenor);
+    cudaFree(d_div_events_by_tenor);
+    cudaFree(d_n_div_events_by_tenor);
+
+    // NEW: free schedules
+    if (d_unique_tenors) cudaFree(d_unique_tenors);
+    if (d_r_by_tenor) cudaFree(d_r_by_tenor);
+    if (d_df_tT_by_tenor) cudaFree(d_df_tT_by_tenor);
+
     if (d_rates_curve) cudaFree(d_rates_curve);
     if (d_rates_times) cudaFree(d_rates_times);
 
@@ -1055,73 +1194,139 @@ std::vector<float> get_v_fd_delta_cuda(
     const std::vector<float> &rates_curve,
     const std::vector<float> &rates_times,
     const std::vector<float> &div_amounts,
-    const std::vector<float> &div_times) {
-    int n_options = spots.size();
-    std::vector<float> deltas(n_options);
-
+    const std::vector<float> &div_times)
+{
+    const int n_options = static_cast<int>(spots.size());
+    std::vector<float> deltas(n_options, std::numeric_limits<float>::quiet_NaN());
     if (n_options == 0) return deltas;
 
-    int n_divs = div_amounts.size();
-    int n_rates = rates_curve.size();
-
-    float *d_spots, *d_strikes, *d_tenors, *d_sigmas;
-    int *d_v_is_call;
-    float *d_div_amounts = nullptr, *d_div_times = nullptr;
-    float *d_deltas;
-    float *d_rates_curve = nullptr, *d_rates_times = nullptr;
-
-    cudaMalloc(&d_spots, n_options * sizeof(float));
-    cudaMalloc(&d_strikes, n_options * sizeof(float));
-    cudaMalloc(&d_tenors, n_options * sizeof(float));
-    cudaMalloc(&d_sigmas, n_options * sizeof(float));
-    cudaMalloc(&d_v_is_call, n_options * sizeof(uint8_t));
-    cudaMalloc(&d_deltas, n_options * sizeof(float));
-
-    cudaMemcpy(d_spots, spots.data(), n_options * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_strikes, strikes.data(), n_options * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_tenors, tenors.data(), n_options * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_sigmas, sigmas.data(), n_options * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_v_is_call, v_is_call.data(), n_options * sizeof(uint8_t), cudaMemcpyHostToDevice);
-
-    if (n_divs > 0 && div_amounts.size() == div_times.size()) {
-        cudaMalloc(&d_div_amounts, n_divs * sizeof(float));
-        cudaMalloc(&d_div_times, n_divs * sizeof(float));
-        cudaMemcpy(d_div_amounts, div_amounts.data(), n_divs * sizeof(float), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_div_times, div_times.data(), n_divs * sizeof(float), cudaMemcpyHostToDevice);
+    if (strikes.size() != static_cast<size_t>(n_options) ||
+        tenors.size()  != static_cast<size_t>(n_options) ||
+        v_is_call.size()!= static_cast<size_t>(n_options) ||
+        sigmas.size()  != static_cast<size_t>(n_options)) {
+        return deltas;
     }
 
-    if (n_rates > 0 && rates_curve.size() == rates_times.size()) {
+    if (!rates_curve.empty() && rates_curve.size() != rates_times.size()) return deltas;
+    if (!div_amounts.empty() && div_amounts.size() != div_times.size()) return deltas;
+
+    // Per-tenor dividend schedules (and tenors bucketing) like price/IV
+    const int time_steps = 200;   // FD grid time steps (keep consistent with your pricer defaults)
+    const int space_steps = 200;  // FD grid space steps
+    const TenorDividendScheduleHost sched = build_tenor_dividend_schedule_host(
+        tenors, time_steps, rates_curve, rates_times, div_amounts, div_times
+    );
+    const int n_unique = static_cast<int>(sched.unique_tenors.size());
+    const int n_rates = static_cast<int>(rates_curve.size());
+
+    float *d_spots=nullptr, *d_strikes=nullptr, *d_tenors=nullptr, *d_sigmas=nullptr, *d_out=nullptr;
+    uint8_t *d_rights=nullptr;
+
+    int *d_tenor_ids=nullptr;
+    float *d_pv_divs_by_tenor=nullptr;
+    DivEvent *d_div_events_by_tenor=nullptr;
+    int *d_n_div_events_by_tenor=nullptr;
+
+    float *d_rates_curve=nullptr, *d_rates_times=nullptr;
+
+    float *d_unique_tenors=nullptr, *d_r_by_tenor=nullptr, *d_df_tT_by_tenor=nullptr;
+
+    cudaMalloc(&d_spots,   n_options * sizeof(float));
+    cudaMalloc(&d_strikes, n_options * sizeof(float));
+    cudaMalloc(&d_tenors,  n_options * sizeof(float));
+    cudaMalloc(&d_sigmas,  n_options * sizeof(float));
+    cudaMalloc(&d_rights,  n_options * sizeof(uint8_t));
+    cudaMalloc(&d_out,     n_options * sizeof(float));
+
+    cudaMemcpy(d_spots,   spots.data(),   n_options * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_strikes, strikes.data(), n_options * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_tenors,  tenors.data(),  n_options * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_sigmas,  sigmas.data(),  n_options * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_rights,  v_is_call.data(), n_options * sizeof(uint8_t), cudaMemcpyHostToDevice);
+
+    cudaMalloc(&d_tenor_ids, n_options * sizeof(int));
+    cudaMemcpy(d_tenor_ids, sched.tenor_ids.data(), n_options * sizeof(int), cudaMemcpyHostToDevice);
+
+    cudaMalloc(&d_pv_divs_by_tenor, n_unique * sizeof(float));
+    cudaMalloc(&d_n_div_events_by_tenor, n_unique * sizeof(int));
+    cudaMalloc(&d_div_events_by_tenor, static_cast<size_t>(n_unique) * MAX_DIV_EVENTS * sizeof(DivEvent));
+
+    cudaMemcpy(d_pv_divs_by_tenor, sched.pv_divs_by_tenor.data(), n_unique * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_n_div_events_by_tenor, sched.n_div_events_by_tenor.data(), n_unique * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_div_events_by_tenor, sched.div_events_by_tenor.data(),
+               static_cast<size_t>(n_unique) * MAX_DIV_EVENTS * sizeof(DivEvent), cudaMemcpyHostToDevice);
+
+    if (n_rates > 0) {
         cudaMalloc(&d_rates_curve, n_rates * sizeof(float));
         cudaMalloc(&d_rates_times, n_rates * sizeof(float));
         cudaMemcpy(d_rates_curve, rates_curve.data(), n_rates * sizeof(float), cudaMemcpyHostToDevice);
         cudaMemcpy(d_rates_times, rates_times.data(), n_rates * sizeof(float), cudaMemcpyHostToDevice);
     }
 
-    int block_size = 256;
-    int grid_size = (n_options + block_size - 1) / block_size;
+    // Precompute per-tenor rate/df schedules on GPU
+    if (n_unique > 0) {
+        cudaMalloc(&d_unique_tenors, n_unique * sizeof(float));
+        cudaMemcpy(d_unique_tenors, sched.unique_tenors.data(), n_unique * sizeof(float), cudaMemcpyHostToDevice);
 
-    compute_delta_kernel_threadlocal<<<grid_size, block_size>>>(
-        d_spots, d_strikes, d_tenors, d_sigmas, d_v_is_call, n_steps, n_options,
+        cudaMalloc(&d_r_by_tenor, static_cast<size_t>(n_unique) * RATE_SCHED_STRIDE * sizeof(float));
+        cudaMalloc(&d_df_tT_by_tenor, static_cast<size_t>(n_unique) * RATE_SCHED_STRIDE * sizeof(float));
+
+        build_rates_schedule_kernel<<<n_unique, RATE_SCHED_STRIDE>>>(
+            d_unique_tenors, n_unique,
+            time_steps,
+            d_rates_curve, d_rates_times, n_rates,
+            d_r_by_tenor,
+            d_df_tT_by_tenor
+        );
+    }
+
+    const int block_size = 256;
+    const int grid_size = (n_options + block_size - 1) / block_size;
+
+    // rel_shift: use something small; n_steps is kept for API compatibility (FD delta uses shift, not binomial steps)
+    const float rel_shift = 1e-4f;
+    compute_fd_delta_kernel<<<grid_size, block_size>>>(
+        d_spots, d_strikes, d_tenors, d_sigmas, d_rights,
+        d_tenor_ids,
+        d_pv_divs_by_tenor,
+        d_div_events_by_tenor,
+        d_n_div_events_by_tenor,
+        d_r_by_tenor,
+        d_df_tT_by_tenor,
         d_rates_curve, d_rates_times, n_rates,
-        d_div_amounts, d_div_times, n_divs, d_deltas
+        time_steps, space_steps,
+        n_options,
+        rel_shift,
+        d_out
     );
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess)
-        throw std::runtime_error("CUDA kernel launch failed: " + std::string(cudaGetErrorString(err)));
 
-    cudaMemcpy(deltas.data(), d_deltas, n_options * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error("CUDA kernel launch failed: " + std::string(cudaGetErrorString(err)));
+    }
+
+    cudaMemcpy(deltas.data(), d_out, n_options * sizeof(float), cudaMemcpyDeviceToHost);
 
     cudaFree(d_spots);
     cudaFree(d_strikes);
     cudaFree(d_tenors);
     cudaFree(d_sigmas);
-    cudaFree(d_v_is_call);
-    cudaFree(d_deltas);
-    if (d_div_amounts) cudaFree(d_div_amounts);
-    if (d_div_times) cudaFree(d_div_times);
+    cudaFree(d_rights);
+    cudaFree(d_out);
+
+    cudaFree(d_tenor_ids);
+    cudaFree(d_pv_divs_by_tenor);
+    cudaFree(d_div_events_by_tenor);
+    cudaFree(d_n_div_events_by_tenor);
+
+    if (d_unique_tenors) cudaFree(d_unique_tenors);
+    if (d_r_by_tenor) cudaFree(d_r_by_tenor);
+    if (d_df_tT_by_tenor) cudaFree(d_df_tT_by_tenor);
+
     if (d_rates_curve) cudaFree(d_rates_curve);
     if (d_rates_times) cudaFree(d_rates_times);
 
+    (void)n_steps; // API compatibility: currently not used in FD delta
     return deltas;
 }
 
@@ -1135,160 +1340,135 @@ std::vector<float> get_v_fd_vega_cuda(
     const std::vector<float> &rates_curve,
     const std::vector<float> &rates_times,
     const std::vector<float> &div_amounts,
-    const std::vector<float> &div_times) {
-    int n_options = spots.size();
-    std::vector<float> vegas(n_options);
-
+    const std::vector<float> &div_times)
+{
+    const int n_options = static_cast<int>(spots.size());
+    std::vector<float> vegas(n_options, std::numeric_limits<float>::quiet_NaN());
     if (n_options == 0) return vegas;
 
-    int n_divs = div_amounts.size();
-    int n_rates = rates_curve.size();
-
-    float *d_spots, *d_strikes, *d_tenors, *d_sigmas;
-    uint8_t *d_v_is_call;
-    float *d_div_amounts = nullptr, *d_div_times = nullptr;
-    float *d_vegas;
-    float *d_rates_curve = nullptr, *d_rates_times = nullptr;
-
-    cudaMalloc(&d_spots, n_options * sizeof(float));
-    cudaMalloc(&d_strikes, n_options * sizeof(float));
-    cudaMalloc(&d_tenors, n_options * sizeof(float));
-    cudaMalloc(&d_sigmas, n_options * sizeof(float));
-    cudaMalloc(&d_v_is_call, n_options * sizeof(uint8_t));
-    cudaMalloc(&d_vegas, n_options * sizeof(float));
-
-    cudaMemcpy(d_spots, spots.data(), n_options * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_strikes, strikes.data(), n_options * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_tenors, tenors.data(), n_options * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_sigmas, sigmas.data(), n_options * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_v_is_call, v_is_call.data(), n_options * sizeof(uint8_t), cudaMemcpyHostToDevice);
-
-    if (n_divs > 0 && div_amounts.size() == div_times.size()) {
-        cudaMalloc(&d_div_amounts, n_divs * sizeof(float));
-        cudaMalloc(&d_div_times, n_divs * sizeof(float));
-        cudaMemcpy(d_div_amounts, div_amounts.data(), n_divs * sizeof(float), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_div_times, div_times.data(), n_divs * sizeof(float), cudaMemcpyHostToDevice);
+    if (strikes.size() != static_cast<size_t>(n_options) ||
+        tenors.size()  != static_cast<size_t>(n_options) ||
+        v_is_call.size()!= static_cast<size_t>(n_options) ||
+        sigmas.size()  != static_cast<size_t>(n_options)) {
+        return vegas;
     }
 
-    if (n_rates > 0 && rates_curve.size() == rates_times.size()) {
+    if (!rates_curve.empty() && rates_curve.size() != rates_times.size()) return vegas;
+    if (!div_amounts.empty() && div_amounts.size() != div_times.size()) return vegas;
+
+    const int time_steps = 200;
+    const int space_steps = 200;
+    const TenorDividendScheduleHost sched = build_tenor_dividend_schedule_host(
+        tenors, time_steps, rates_curve, rates_times, div_amounts, div_times
+    );
+    const int n_unique = static_cast<int>(sched.unique_tenors.size());
+    const int n_rates = static_cast<int>(rates_curve.size());
+
+    float *d_spots=nullptr, *d_strikes=nullptr, *d_tenors=nullptr, *d_sigmas=nullptr, *d_out=nullptr;
+    uint8_t *d_rights=nullptr;
+
+    int *d_tenor_ids=nullptr;
+    float *d_pv_divs_by_tenor=nullptr;
+    DivEvent *d_div_events_by_tenor=nullptr;
+    int *d_n_div_events_by_tenor=nullptr;
+
+    float *d_rates_curve=nullptr, *d_rates_times=nullptr;
+
+    float *d_unique_tenors=nullptr, *d_r_by_tenor=nullptr, *d_df_tT_by_tenor=nullptr;
+
+    cudaMalloc(&d_spots,   n_options * sizeof(float));
+    cudaMalloc(&d_strikes, n_options * sizeof(float));
+    cudaMalloc(&d_tenors,  n_options * sizeof(float));
+    cudaMalloc(&d_sigmas,  n_options * sizeof(float));
+    cudaMalloc(&d_rights,  n_options * sizeof(uint8_t));
+    cudaMalloc(&d_out,     n_options * sizeof(float));
+
+    cudaMemcpy(d_spots,   spots.data(),   n_options * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_strikes, strikes.data(), n_options * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_tenors,  tenors.data(),  n_options * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_sigmas,  sigmas.data(),  n_options * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_rights,  v_is_call.data(), n_options * sizeof(uint8_t), cudaMemcpyHostToDevice);
+
+    cudaMalloc(&d_tenor_ids, n_options * sizeof(int));
+    cudaMemcpy(d_tenor_ids, sched.tenor_ids.data(), n_options * sizeof(int), cudaMemcpyHostToDevice);
+
+    cudaMalloc(&d_pv_divs_by_tenor, n_unique * sizeof(float));
+    cudaMalloc(&d_n_div_events_by_tenor, n_unique * sizeof(int));
+    cudaMalloc(&d_div_events_by_tenor, static_cast<size_t>(n_unique) * MAX_DIV_EVENTS * sizeof(DivEvent));
+
+    cudaMemcpy(d_pv_divs_by_tenor, sched.pv_divs_by_tenor.data(), n_unique * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_n_div_events_by_tenor, sched.n_div_events_by_tenor.data(), n_unique * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_div_events_by_tenor, sched.div_events_by_tenor.data(),
+               static_cast<size_t>(n_unique) * MAX_DIV_EVENTS * sizeof(DivEvent), cudaMemcpyHostToDevice);
+
+    if (n_rates > 0) {
         cudaMalloc(&d_rates_curve, n_rates * sizeof(float));
         cudaMalloc(&d_rates_times, n_rates * sizeof(float));
         cudaMemcpy(d_rates_curve, rates_curve.data(), n_rates * sizeof(float), cudaMemcpyHostToDevice);
         cudaMemcpy(d_rates_times, rates_times.data(), n_rates * sizeof(float), cudaMemcpyHostToDevice);
     }
 
-    int block_size = 256;
-    int grid_size = (n_options + block_size - 1) / block_size;
+    if (n_unique > 0) {
+        cudaMalloc(&d_unique_tenors, n_unique * sizeof(float));
+        cudaMemcpy(d_unique_tenors, sched.unique_tenors.data(), n_unique * sizeof(float), cudaMemcpyHostToDevice);
 
-    compute_vega_kernel_threadlocal<<<grid_size, block_size>>>(
-        d_spots, d_strikes, d_tenors, d_sigmas, d_v_is_call, n_steps, n_options,
+        cudaMalloc(&d_r_by_tenor, static_cast<size_t>(n_unique) * RATE_SCHED_STRIDE * sizeof(float));
+        cudaMalloc(&d_df_tT_by_tenor, static_cast<size_t>(n_unique) * RATE_SCHED_STRIDE * sizeof(float));
+
+        build_rates_schedule_kernel<<<n_unique, RATE_SCHED_STRIDE>>>(
+            d_unique_tenors, n_unique,
+            time_steps,
+            d_rates_curve, d_rates_times, n_rates,
+            d_r_by_tenor,
+            d_df_tT_by_tenor
+        );
+    }
+
+    const int block_size = 256;
+    const int grid_size = (n_options + block_size - 1) / block_size;
+
+    const float abs_shift = 1e-4f;
+    compute_fd_vega_kernel<<<grid_size, block_size>>>(
+        d_spots, d_strikes, d_tenors, d_sigmas, d_rights,
+        d_tenor_ids,
+        d_pv_divs_by_tenor,
+        d_div_events_by_tenor,
+        d_n_div_events_by_tenor,
+        d_r_by_tenor,
+        d_df_tT_by_tenor,
         d_rates_curve, d_rates_times, n_rates,
-        d_div_amounts, d_div_times, n_divs, d_vegas
+        time_steps, space_steps,
+        n_options,
+        abs_shift,
+        d_out
     );
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess)
-        throw std::runtime_error("CUDA kernel launch failed: " + std::string(cudaGetErrorString(err)));
 
-    cudaMemcpy(vegas.data(), d_vegas, n_options * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error("CUDA kernel launch failed: " + std::string(cudaGetErrorString(err)));
+    }
+
+    cudaMemcpy(vegas.data(), d_out, n_options * sizeof(float), cudaMemcpyDeviceToHost);
 
     cudaFree(d_spots);
     cudaFree(d_strikes);
     cudaFree(d_tenors);
     cudaFree(d_sigmas);
-    cudaFree(d_v_is_call);
-    cudaFree(d_vegas);
-    if (d_div_amounts) cudaFree(d_div_amounts);
-    if (d_div_times) cudaFree(d_div_times);
+    cudaFree(d_rights);
+    cudaFree(d_out);
+
+    cudaFree(d_tenor_ids);
+    cudaFree(d_pv_divs_by_tenor);
+    cudaFree(d_div_events_by_tenor);
+    cudaFree(d_n_div_events_by_tenor);
+
+    if (d_unique_tenors) cudaFree(d_unique_tenors);
+    if (d_r_by_tenor) cudaFree(d_r_by_tenor);
+    if (d_df_tT_by_tenor) cudaFree(d_df_tT_by_tenor);
+
     if (d_rates_curve) cudaFree(d_rates_curve);
     if (d_rates_times) cudaFree(d_rates_times);
 
+    (void)n_steps; // API compatibility: currently not used in FD vega
     return vegas;
-}
-
-std::vector<float> get_v_iv_binomial_cuda(
-    const std::vector<float> &prices,
-    const std::vector<float> &spots,
-    const std::vector<float> &strikes,
-    const std::vector<float> &tenors,
-    const std::vector<uint8_t> &v_is_call,
-    const std::vector<float> &rates_curve,
-    const std::vector<float> &rates_times,
-    const std::vector<float> &div_amounts,
-    const std::vector<float> &div_times,
-    const float tol,
-    const int max_iter,
-    const float v_min,
-    const float v_max,
-    const float steps_factor
-) {
-    int n_options = prices.size();
-    std::vector<float> results(n_options);
-
-    if (n_options == 0) return results;
-
-    int n_divs = div_amounts.size();
-    int n_rates = rates_curve.size();
-
-    // Allocate device memory (inputs + outputs)
-    float *d_prices, *d_spots, *d_strikes, *d_tenors, *d_results;
-    uint8_t *d_v_is_call;
-    float *d_div_amounts = nullptr, *d_div_times = nullptr;
-    float *d_rates_curve = nullptr, *d_rates_times = nullptr;
-
-    cudaMalloc(&d_prices, n_options * sizeof(float));
-    cudaMalloc(&d_spots, n_options * sizeof(float));
-    cudaMalloc(&d_strikes, n_options * sizeof(float));
-    cudaMalloc(&d_tenors, n_options * sizeof(float));
-    cudaMalloc(&d_v_is_call, n_options * sizeof(uint8_t));
-    cudaMalloc(&d_results, n_options * sizeof(float));
-
-    cudaMemcpy(d_prices, prices.data(), n_options * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_spots, spots.data(), n_options * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_strikes, strikes.data(), n_options * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_tenors, tenors.data(), n_options * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_v_is_call, v_is_call.data(), n_options * sizeof(uint8_t), cudaMemcpyHostToDevice);
-
-    if (n_divs > 0 && div_amounts.size() == div_times.size()) {
-        cudaMalloc(&d_div_amounts, n_divs * sizeof(float));
-        cudaMalloc(&d_div_times, n_divs * sizeof(float));
-        cudaMemcpy(d_div_amounts, div_amounts.data(), n_divs * sizeof(float), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_div_times, div_times.data(), n_divs * sizeof(float), cudaMemcpyHostToDevice);
-    }
-
-    if (n_rates > 0 && rates_curve.size() == rates_times.size()) {
-        cudaMalloc(&d_rates_curve, n_rates * sizeof(float));
-        cudaMalloc(&d_rates_times, n_rates * sizeof(float));
-        cudaMemcpy(d_rates_curve, rates_curve.data(), n_rates * sizeof(float), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_rates_times, rates_times.data(), n_rates * sizeof(float), cudaMemcpyHostToDevice);
-    }
-
-    // Launch with no shared_mem needed
-    int block_size = 256;
-    int grid_size = (n_options + block_size - 1) / block_size;
-
-    compute_iv_kernel_threadlocal<<<grid_size, block_size>>>(
-        d_prices, d_spots, d_strikes, d_tenors, d_v_is_call,
-        d_rates_curve, d_rates_times, n_rates,
-        n_options,
-        d_div_amounts, d_div_times, n_divs, d_results,
-        tol, max_iter, v_min, v_max, steps_factor
-    );
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess)
-        throw std::runtime_error("CUDA kernel launch failed: " + std::string(cudaGetErrorString(err)));
-
-    cudaMemcpy(results.data(), d_results, n_options * sizeof(float), cudaMemcpyDeviceToHost);
-
-    cudaFree(d_prices);
-    cudaFree(d_spots);
-    cudaFree(d_strikes);
-    cudaFree(d_tenors);
-    cudaFree(d_v_is_call);
-    cudaFree(d_results);
-    if (d_div_amounts) cudaFree(d_div_amounts);
-    if (d_div_times) cudaFree(d_div_times);
-    if (d_rates_curve) cudaFree(d_rates_curve);
-    if (d_rates_times) cudaFree(d_rates_times);
-
-    return results;
 }

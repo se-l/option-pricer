@@ -16,5 +16,5 @@ CUDA enabled option pricer with python stubs to price millions of independent am
 ### C# / .NET
 ```sh
   cd C:\repos\option-pricer\bindings\csharp\
-  dotnet build
+  dotnet build -c Release
 ```

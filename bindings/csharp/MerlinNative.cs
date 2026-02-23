@@ -88,7 +88,7 @@ namespace Merlin
         /// Price a single American option with dividends using CPU FD.
         /// </summary>
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern float merlin_price_american_fd_div_cpu(
+        public static extern float merlin_get_price_fd_cpu(
             float spot,
             float strike,
             float tenor,
@@ -116,17 +116,18 @@ namespace Merlin
             [In] byte[] vIsCall,
             [In] float[] sigmas,
             int count,
-            int nSteps,
             [In] float[] ratesCurve,
             [In] float[] ratesTimes,
             int ratesCount,
             [In] float[] divAmounts,
             [In] float[] divTimes,
-            int divCount
+            int divCount,
+            int timeSteps = 200,
+            int spaceSteps = 200
         );
 
         /// <summary>
-        /// Compute American option Deltas using CUDA.
+        /// Compute vectorized FD delta using CUDA.
         /// </summary>
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
         public static extern void merlin_get_delta_fd_cuda(
@@ -147,7 +148,7 @@ namespace Merlin
         );
 
         /// <summary>
-        /// Compute American option Vegas using CUDA.
+        /// Compute vectorized FD vega using CUDA.
         /// </summary>
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
         public static extern void merlin_get_vega_fd_cuda(

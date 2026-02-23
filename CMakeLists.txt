@@ -5,7 +5,6 @@ project(merlin LANGUAGES CXX CUDA)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-set(CMAKE_BUILD_TYPE Release)
 
 # Find Python + NumPy
 find_package(Python3 COMPONENTS Interpreter Development NumPy REQUIRED)

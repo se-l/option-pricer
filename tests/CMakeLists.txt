@@ -10,6 +10,7 @@ FetchContent_MakeAvailable(Catch2)
 # Create the test executable
 add_executable(merlin_tests
         core/test_pricing_engine.cpp
+        core/test_performance.cpp
 )
 
 # Link against your core library (the OBJECT or STATIC library we created earlier)

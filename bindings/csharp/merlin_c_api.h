@@ -40,7 +40,7 @@ extern "C" {
         int time_steps = 200, int space_steps = 200
     );
 
-    MERLIN_C_API float merlin_price_american_fd_div_cpu(
+    MERLIN_C_API float merlin_get_price_fd_cpu(
         float spot,
         float strike,
         float tenor,
@@ -55,18 +55,11 @@ extern "C" {
     MERLIN_C_API void merlin_get_price_fd_cuda(
         float* out_prices,
         const float* spots, const float* strikes, const float* tenors, const uint8_t* v_is_call, const float* sigmas,
-        int count, int n_steps,
-        const float* rates_curve, const float* rates_times, int rates_count,
-        const float* div_amounts, const float* div_times, int div_count
-    );
-
-    MERLIN_C_API void merlin_get_iv_binomial_cuda(
-        float* out_ivs,
-        const float* prices, const float* spots, const float* strikes, const float* tenors, const uint8_t* v_is_call,
         int count,
         const float* rates_curve, const float* rates_times, int rates_count,
         const float* div_amounts, const float* div_times, int div_count,
-        float tol = 1e-6f, int max_iter = 100, float v_min = 1e-4f, float v_max = 5.0f, float steps_factor = 1.0f
+        int time_steps = 200,
+        int space_steps = 200
     );
 
     MERLIN_C_API void merlin_get_delta_fd_cuda(

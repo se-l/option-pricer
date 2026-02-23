@@ -28,7 +28,7 @@ PYBIND11_MODULE(merlin, m) {
           py::arg("space_steps") = 200
           );
 
-    m.def("get_v_iv_fd_gpu", &get_v_iv_fd_cuda_new,
+    m.def("get_v_iv_fd_gpu", &get_v_iv_fd_cuda,
           "Compute implied volatilities with yield curve and single dividend schedule",
           py::arg("prices"),
           py::arg("spots"),
@@ -47,28 +47,32 @@ PYBIND11_MODULE(merlin, m) {
           py::arg("space_steps") = 200
           );
 
-    m.def("get_v_fd_price", &get_v_fd_price_cuda,
-    "Compute American option prices in vectorized fashion with per-option sigma and yield curve",
-    py::arg("spots"), py::arg("strikes"), py::arg("tenors"),
-    py::arg("sigmas"), py::arg("v_is_call"),
-    py::arg("rates_curve") = std::vector<float>(), py::arg("rates_times") = std::vector<float>(),
-    py::arg("div_amounts") = std::vector<float>(), py::arg("div_times") = std::vector<float>(),
-    py::arg("time_steps"), py::arg("space_steps")
-    );
-
-    m.def("get_v_fd_delta", &get_v_fd_delta_cuda,
-        "Compute American option deltas in vectorized fashion with per-option sigma and yield curve",
-        py::arg("spots"), py::arg("strikes"), py::arg("tenors"), py::arg("v_is_call"),
-        py::arg("sigmas"), py::arg("n_steps") = 100,
+    m.def("get_v_fd_price", &get_v_price_fd_cuda,
+        "Compute American option prices in vectorized fashion with per-option sigma and yield curve",
+        py::arg("spots"), py::arg("strikes"), py::arg("tenors"),
+        py::arg("sigmas"), py::arg("v_is_call"),
         py::arg("rates_curve") = std::vector<float>(), py::arg("rates_times") = std::vector<float>(),
-        py::arg("div_amounts") = std::vector<float>(), py::arg("div_times") = std::vector<float>());
+        py::arg("div_amounts") = std::vector<float>(), py::arg("div_times") = std::vector<float>(),
+        py::arg("time_steps"), py::arg("space_steps")
+        );
 
-    m.def("get_v_fd_vega", &get_v_fd_vega_cuda,
-        "Compute American option vegas in vectorized fashion with per-option sigma and yield curve",
-        py::arg("spots"), py::arg("strikes"), py::arg("tenors"), py::arg("v_is_call"),
-        py::arg("sigmas"), py::arg("n_steps") = 100,
+    m.def("get_fd_price_cpu", &price_american_fd_div_host,
+        "Compute American option prices in vectorized fashion with per-option sigma and yield curve",
+        py::arg("s"), py::arg("k"), py::arg("t"),
+        py::arg("sigma"), py::arg("is_call"),
         py::arg("rates_curve") = std::vector<float>(), py::arg("rates_times") = std::vector<float>(),
-        py::arg("div_amounts") = std::vector<float>(), py::arg("div_times") = std::vector<float>());
+        py::arg("div_amounts") = std::vector<float>(), py::arg("div_times") = std::vector<float>(),
+        py::arg("time_steps"), py::arg("space_steps")
+        );
+
+    m.def("get_v_fd_price_cpu", &v_fd_price_host,
+        "Compute American option prices in vectorized fashion with per-option sigma and yield curve",
+        py::arg("spots"), py::arg("strikes"), py::arg("tenors"),
+        py::arg("sigmas"), py::arg("v_is_call"),
+        py::arg("rates_curve") = std::vector<float>(), py::arg("rates_times") = std::vector<float>(),
+        py::arg("div_amounts") = std::vector<float>(), py::arg("div_times") = std::vector<float>(),
+        py::arg("time_steps"), py::arg("space_steps")
+        );
 
     // Calibration residuals: E-SSVI -> IV -> Price -> residuals
     m.def("f_min_price_surface_theta_rho_psi",

@@ -111,7 +111,7 @@ void merlin_get_iv_fd_gpu(
     const int time_steps,
     const int space_steps
 ) {
-    std::vector<float> results = get_v_iv_fd_cuda_new(
+    std::vector<float> results = get_v_iv_fd_cuda(
         to_vec(prices, count),
         to_vec(spots, count),
         to_vec(strikes, count),
@@ -127,7 +127,7 @@ void merlin_get_iv_fd_gpu(
     std::copy(results.begin(), results.end(), out_ivs);
 }
 
-float merlin_price_american_fd_div_cpu(
+float merlin_get_price_fd_cpu(
     float spot,
     float strike,
     float tenor,
@@ -150,6 +150,100 @@ float merlin_price_american_fd_div_cpu(
         to_vec(div_times, n_divs),
         time_steps, space_steps
     );
+}
+
+void merlin_get_price_fd_cuda(
+    float* out_prices,
+    const float* spots,
+    const float* strikes,
+    const float* tenors,
+    const uint8_t* v_is_call,
+    const float* sigmas,
+    const int count,
+    const float* rates_curve,
+    const float* rates_times,
+    const int n_rates,
+    const float* div_amounts,
+    const float* div_times,
+    const int n_divs,
+    const int time_steps,
+    const int space_steps
+) {
+    std::vector<float> results = get_v_price_fd_cuda(
+        to_vec(spots, count),
+        to_vec(strikes, count),
+        to_vec(tenors, count),
+        to_vec(sigmas, count),
+        to_vec(v_is_call, count),
+        to_vec(rates_curve, n_rates),
+        to_vec(rates_times, n_rates),
+        to_vec(div_amounts, n_divs),
+        to_vec(div_times, n_divs),
+        time_steps, space_steps
+    );
+
+    std::copy(results.begin(), results.end(), out_prices);
+}
+
+
+void merlin_get_delta_fd_cuda(
+    float* out_deltas,
+    const float* spots, const float* strikes, const float* tenors, const uint8_t* v_is_call, const float* sigmas,
+    int count, int n_steps,
+    const float* rates_curve, const float* rates_times, int rates_count,
+    const float* div_amounts, const float* div_times, int div_count
+) {
+    // Defensive check: If pointers are null but count > 0, we would crash/read garbage
+    if (count > 0 && (!out_deltas || !spots || !strikes || !tenors || !v_is_call || !sigmas)) {
+        return;
+    }
+
+    std::vector<float> results = get_v_fd_delta_cuda(
+        to_vec(spots, count),
+        to_vec(strikes, count),
+        to_vec(tenors, count),
+        to_vec(v_is_call, count),
+        to_vec(sigmas, count),
+        n_steps,
+        to_vec(rates_curve, rates_count),
+        to_vec(rates_times, rates_count),
+        to_vec(div_amounts, div_count),
+        to_vec(div_times, div_count)
+    );
+
+    if (!results.empty()) {
+        std::copy(results.begin(), results.end(), out_deltas);
+    }
+}
+
+void merlin_get_vega_fd_cuda(
+    float* out_vegas,
+    const float* spots, const float* strikes, const float* tenors, const uint8_t* v_is_call, const float* sigmas,
+    int count, int n_steps,
+    const float* rates_curve, const float* rates_times, int rates_count,
+    const float* div_amounts, const float* div_times, int div_count
+) {
+    // Defensive check: If pointers are null but count > 0, we would crash/read garbage
+    if (count > 0 && (!out_vegas || !spots || !strikes || !tenors || !v_is_call || !sigmas)) {
+        return;
+    }
+
+    std::vector<float> results = get_v_fd_vega_cuda(
+        to_vec(spots, count),
+        to_vec(strikes, count),
+        to_vec(tenors, count),
+        to_vec(v_is_call, count),
+        to_vec(sigmas, count),
+        n_steps,
+        to_vec(rates_curve, rates_count),
+        to_vec(rates_times, rates_count),
+        to_vec(div_amounts, div_count),
+        to_vec(div_times, div_count)
+    );
+
+    if (!results.empty()) {
+        std::copy(results.begin(), results.end(), out_vegas);
+    }
 }
 
 } // extern "C"

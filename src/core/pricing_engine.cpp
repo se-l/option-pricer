@@ -25,6 +25,99 @@ static float get_rate_at_time_host(float t, const float *rates_curve,
     return rates_curve[n_points - 1];
 }
 
+static float get_rate_at_time_convex_monotone_host(
+    float t,
+    const float* rates_curve,
+    const float* rates_times,
+    int n_points)
+{
+    if (n_points <= 0) return 0.0f;
+    if (t <= 0.0f) {
+        // Best-effort: use first available rate as short rate proxy.
+        return rates_curve[0];
+    }
+
+    // Clamp outside curve domain
+    if (t <= rates_times[0]) return rates_curve[0];
+    if (t >= rates_times[n_points - 1]) return rates_curve[n_points - 1];
+
+    // Find interval k such that t in (t_k, t_{k+1}]
+    int k = 0;
+    for (int i = 0; i < n_points - 1; ++i) {
+        if (t <= rates_times[i + 1]) { k = i; break; }
+    }
+
+    // Helper lambdas (kept local to avoid polluting file scope)
+    auto Z = [&](int i) -> float { return rates_curve[i] * rates_times[i]; };
+    auto f_interval = [&](int i) -> float {
+        const float t0 = rates_times[i];
+        const float t1 = rates_times[i + 1];
+        const float h = t1 - t0;
+        if (!(h > 0.0f)) return 0.0f;
+        return (Z(i + 1) - Z(i)) / h;
+    };
+    auto clampf = [&](float x, float lo, float hi) -> float {
+        return fminf(fmaxf(x, lo), hi);
+    };
+
+    // Node forwards fhat_i with monotone limiter (Fritsch-Carlson style on slopes)
+    auto fhat = [&](int i) -> float {
+        if (i <= 0) return f_interval(0);
+        if (i >= n_points - 1) return f_interval(n_points - 2);
+
+        const float fL = f_interval(i - 1);
+        const float fR = f_interval(i);
+
+        // If slope changes sign, set to 0 to avoid overshoot
+        if (fL * fR <= 0.0f) return 0.0f;
+
+        // Weighted harmonic mean for stability and monotonicity
+        const float hL = rates_times[i] - rates_times[i - 1];
+        const float hR = rates_times[i + 1] - rates_times[i];
+        const float wL = 2.0f * hR + hL;
+        const float wR = hR + 2.0f * hL;
+        const float denom = (wL / fL) + (wR / fR);
+        if (fabsf(denom) < 1e-20f) return 0.0f;
+        float fh = (wL + wR) / denom;
+
+        // Additional bounding: keep within neighboring interval forwards
+        const float lo = fminf(fL, fR);
+        const float hi = fmaxf(fL, fR);
+        return clampf(fh, lo, hi);
+    };
+
+    const float t0 = rates_times[k];
+    const float t1 = rates_times[k + 1];
+    const float h = t1 - t0;
+    if (!(h > 0.0f)) return rates_curve[k];
+
+    const float x = (t - t0) / h; // in (0,1]
+    const float fbar = f_interval(k);     // average forward over interval
+    const float fL = fhat(k);             // node forward at left
+    const float fR = fhat(k + 1);         // node forward at right
+
+    // Quadratic forward: f(x) = fL + (fR-fL)*x + c*x*(1-x)
+    // Enforce average over [0,1] equals fbar => c = 6*(fbar - (fL+fR)/2)
+    float c = 6.0f * (fbar - 0.5f * (fL + fR));
+
+    // Monotone safeguard: ensure midpoint doesn't overshoot endpoint range
+    const float f_mid = 0.5f * (fL + fR) + 0.25f * c;
+    const float lo = fminf(fL, fR);
+    const float hi = fmaxf(fL, fR);
+    if (f_mid < lo || f_mid > hi) {
+        const float target = (f_mid < lo) ? lo : hi;
+        // f_mid = (fL+fR)/2 + c/4  =>  c = 4*(target - (fL+fR)/2)
+        c = 4.0f * (target - 0.5f * (fL + fR));
+    }
+
+    float f = fL + (fR - fL) * x + c * x * (1.0f - x);
+
+    // Final clamp (very conservative; avoids NaN/Inf propagation)
+    f = clampf(f, lo - 1e6f, hi + 1e6f);
+    if (!std::isfinite(f)) return rates_curve[k];
+    return f;
+}
+
 
 // Simple tridiagonal solver (Thomas algorithm) for A * x = d
 static void solve_tridiagonal(
@@ -52,8 +145,45 @@ static void solve_tridiagonal(
     }
 }
 
+static float get_Z_at_time_host(float t, const float* rates_curve,
+                               const float* rates_times, int n_points) {
+    // Z(t) = R(t) * t with linear interpolation on the (time, Z) points.
+    if (n_points <= 0) return 0.0f;
+    if (t <= 0.0f) return 0.0f;
 
-// Improved FD pricer with better put handling near dividends
+    if (t <= rates_times[0]) {
+        return rates_curve[0] * t;
+    }
+    if (t >= rates_times[n_points - 1]) {
+        return rates_curve[n_points - 1] * t;
+    }
+
+    for (int i = 0; i < n_points - 1; ++i) {
+        if (t <= rates_times[i + 1]) {
+            float t0 = rates_times[i];
+            float t1 = rates_times[i + 1];
+            float z0 = rates_curve[i] * t0;
+            float z1 = rates_curve[i + 1] * t1;
+
+            float w = (t - t0) / (t1 - t0);
+            return (1.0f - w) * z0 + w * z1;
+        }
+    }
+    return rates_curve[n_points - 1] * t;
+}
+
+static float df_0_t_host(float t, const float* rates_curve,
+                         const float* rates_times, int n_points) {
+    return std::expf(-get_Z_at_time_host(t, rates_curve, rates_times, n_points));
+}
+
+static float df_t_T_host(float t, float T, const float* rates_curve,
+                         const float* rates_times, int n_points) {
+    float Zt = get_Z_at_time_host(t, rates_curve, rates_times, n_points);
+    float ZT = get_Z_at_time_host(T, rates_curve, rates_times, n_points);
+    return std::expf(-(ZT - Zt));
+}
+
 float price_american_fd_div_host(
     float S, float K, float T,
     float sigma, uint8_t is_call,
@@ -72,23 +202,23 @@ float price_american_fd_div_host(
 
     const float dt = T / static_cast<float>(N_t);
 
+    const float* rc = rates_curve.empty() ? nullptr : rates_curve.data();
+    const float* rt = rates_times.empty() ? nullptr : rates_times.data();
+    const int n_rates = static_cast<int>(rates_curve.size());
+
     // Calculate PV of dividends for grid construction
     float pv_divs = 0.0f;
     for (std::size_t i = 0; i < div_amounts.size() && i < div_times.size(); ++i) {
         float t_div = div_times[i];
         if (t_div > 0.0f && t_div <= T) {
-            float r_div = get_rate_at_time_host(t_div,
-                                               rates_curve.empty() ? nullptr : rates_curve.data(),
-                                               rates_times.empty() ? nullptr : rates_times.data(),
-                                               static_cast<int>(rates_curve.size()));
-            pv_divs += div_amounts[i] * std::exp(-r_div * t_div);
+            pv_divs += div_amounts[i] * df_0_t_host(t_div, rc, rt, n_rates);
         }
     }
 
     // float S_grid_center = std::fmax(S - pv_divs, S * 0.1f);
 
     // Build spatial grid - ensure it covers likely dividend scenarios
-    float r0 = get_rate_at_time_host(0.0f,
+    float r0 = get_rate_at_time_convex_monotone_host(0.0f,
                                      rates_curve.empty() ? nullptr : rates_curve.data(),
                                      rates_times.empty() ? nullptr : rates_times.data(),
                                      static_cast<int>(rates_curve.size()));
@@ -96,7 +226,8 @@ float price_american_fd_div_host(
     // For puts, ensure grid goes low enough to capture deep ITM scenarios
     float S_min = 0.0f;  // Always start at zero for puts
     float S_max = std::fmaxf(
-        (S + pv_divs) * std::expf((r0 + 4.0f * sigma) * T),
+        (S + pv_divs) *
+        std::expf(fminf(r0 * T + 4.0f * sigma * sqrt(T), 80.0f)), // 80 protects against overflow
         3.0f * std::fmaxf(S, K)
     );
 
@@ -141,10 +272,7 @@ float price_american_fd_div_host(
     // Backward time stepping
     for (int n = N_t - 1; n >= 0; --n) {
         float t = n * dt;
-        float r = get_rate_at_time_host(t,
-                                        rates_curve.empty() ? nullptr : rates_curve.data(),
-                                        rates_times.empty() ? nullptr : rates_times.data(),
-                                        static_cast<int>(rates_curve.size()));
+        float r = get_rate_at_time_convex_monotone_host(t, rc, rt, n_rates);
 
         // Crank-Nicolson with theta = 0.5
         const float theta = 0.5f;
@@ -153,7 +281,14 @@ float price_american_fd_div_host(
         // Interior points: i = 1 to N_s - 1
         for (int i = 1; i < N_s; ++i) {
             float Si = S_grid[i];
-            if (Si < 1e-8f) continue; // Skip near-zero nodes
+            if (Si < 1e-8f) {
+                // Do NOT skip: define a stable identity row to avoid stale coefficients.
+                a[i] = 0.0f;
+                b[i] = 1.0f;
+                c[i] = 0.0f;
+                rhs[i] = V[i];
+                continue;
+            }
 
             float Si2 = Si * Si;
 
@@ -183,12 +318,11 @@ float price_american_fd_div_host(
             b[0] = 1.0f;
             c[0] = 0.0f;
 
-            float t_remaining = T - t;
             if (is_call) {
                 rhs[0] = 0.0f;
             } else {
-                // Put at S=0: worth K*exp(-r*(T-t))
-                rhs[0] = K * std::expf(-r * t_remaining);
+                // Put at S=0: worth K * D(t,T)
+                rhs[0] = K * df_t_T_host(t, T, rc, rt, n_rates);
             }
         }
 
@@ -198,10 +332,9 @@ float price_american_fd_div_host(
             b[N_s] = 1.0f;
             c[N_s] = 0.0f;
 
-            float t_remaining = T - t;
             if (is_call) {
-                // Call at large S: V ≈ S - K*exp(-r*(T-t))
-                rhs[N_s] = S_grid[N_s] - K * std::expf(-r * t_remaining);
+                // Call at large S: V ≈ S - K * D(t,T)
+                rhs[N_s] = S_grid[N_s] - K * df_t_T_host(t, T, rc, rt, n_rates);
             } else {
                 // Put at large S: worth approximately 0
                 rhs[N_s] = 0.0f;
@@ -272,6 +405,54 @@ float price_american_fd_div_host(
     return (1.0f - w) * V[idx] + w * V[idx + 1];
 }
 
+// Vectorized CPU FD price wrapper (American w/ discrete cash dividends)
+std::vector<float> v_fd_price_host(
+    const std::vector<float>& spots,
+    const std::vector<float>& strikes,
+    const std::vector<float>& tenors,
+    const std::vector<float>& sigmas,
+    const std::vector<uint8_t>& v_is_call,
+    const std::vector<float>& rates_curve = {},
+    const std::vector<float>& rates_times = {},
+    const std::vector<float>& div_amounts = {},
+    const std::vector<float>& div_times   = {},
+    const int time_steps  = 200,
+    const int space_steps = 200)
+{
+    const std::size_t n = spots.size();
+    std::vector out(n, std::numeric_limits<float>::quiet_NaN());
+
+    if (n == 0) return out;
+
+    // Validate input sizes
+    if (strikes.size() != n || tenors.size() != n || sigmas.size() != n || v_is_call.size() != n) {
+        return out;
+    }
+
+    for (std::size_t i = 0; i < n; ++i) {
+        const float   S       = spots[i];
+        const float   K       = strikes[i];
+        const float   T       = tenors[i];
+        const float   sigma   = sigmas[i];
+        const uint8_t is_call = v_is_call[i];
+
+        // Basic sanity: match scalar behavior (intrinsic for invalid/degenerate inputs)
+        if (!std::isfinite(S) || !std::isfinite(K) || !std::isfinite(T) || !std::isfinite(sigma)) {
+            out[i] = std::numeric_limits<float>::quiet_NaN();
+            continue;
+        }
+
+        out[i] = price_american_fd_div_host(
+            S, K, T, sigma, is_call,
+            rates_curve, rates_times,
+            div_amounts, div_times,
+            time_steps, space_steps
+        );
+    }
+
+    return out;
+}
+
 // Refactored IV solver with better convergence
 float implied_vol_american_fd_host(
     const float target,
@@ -319,7 +500,8 @@ float implied_vol_american_fd_host(
         div_amounts, div_times,
         time_steps, space_steps);
 
-    // Target below minimum possible price
+    // Target below minimum possible price. That can short circuit certain evaluations.
+    // Would want to rerun with higher time / space steps
     if (target <= p_low + 1e-9f)
         return v_min;
 
@@ -382,12 +564,12 @@ std::vector<float> get_v_iv_fd_cpu(
     const int   max_iter    = 100,
     const float v_min       = 1e-4f,
     const float v_max       = 5.0f,
-    const int time_steps = 200,
-    const int space_steps = 200
+    const int time_steps = 1000,
+    const int space_steps = 1000
     )
 {
     const std::size_t n_options = prices.size();
-    std::vector<float> results(n_options, std::numeric_limits<float>::quiet_NaN());
+    std::vector results(n_options, std::numeric_limits<float>::quiet_NaN());
 
     if (n_options == 0)
         return results;
@@ -429,7 +611,7 @@ std::vector<float> get_v_iv_fd_cpu(
 
         // Check if price is reasonable (not below intrinsic)
         if (p < intrinsic - 1e-6f) {
-            results[i] = std::numeric_limits<float>::quiet_NaN();
+            results[i] = v_min;
             continue;
         }
 
@@ -445,191 +627,49 @@ std::vector<float> get_v_iv_fd_cpu(
     return results;
 }
 
-// static float price_american_binomial_cash_div_threadlocal_host(
-//     float S, float K, float T,
-//     float sigma, uint8_t is_call, int n_steps,
-//     const float *rates_curve, const float *rates_times, int n_rates,
-//     const float *div_amounts, const int *div_steps, int n_divs) {
-//
-//     constexpr int MAX_STEPS = 512;
-//     float V[MAX_STEPS + 1];
-//
-//     // Defensive bound for exponent
-//     if (n_steps > MAX_STEPS) n_steps = MAX_STEPS;
-//
-//     // Scaling time steps for short T (same as device)
-//     int effective_steps = n_steps;
-//     if (T < 0.1f) {
-//         effective_steps = static_cast<int>(T * n_steps * 10);
-//         if (effective_steps > n_steps)  effective_steps = n_steps;
-//         if (effective_steps < 10)       effective_steps = 10;
-//     }
-//     if (effective_steps > MAX_STEPS) effective_steps = MAX_STEPS;
-//
-//     float dt = T / effective_steps;
-//
-//     // Same dt sanity shortcuts
-//     if (dt <= 0.0f) {
-//         return is_call ? std::fmax(S - K, 0.0f) : std::fmax(K - S, 0.0f);
-//     }
-//     if (dt < 1e-6f) {
-//         return is_call ? std::fmax(S - K, 0.0f) : std::fmax(K - S, 0.0f);
-//     }
-//
-//     // Standard CRR multipliers
-//     float u = std::exp(sigma * std::sqrt(dt));
-//     if (u <= 1.001f) u = 1.001f;  // numerical safety
-//     float d = 1.0f / u;
-//     int   N = effective_steps;
-//
-//     // 1. Terminal payoffs with cash dividends applied along each path
-//     float u2     = u * u;
-//     float curr_S = S * std::pow(d, static_cast<float>(N));  // bottom node (all downs)
-//
-//     for (int j = 0; j <= N; ++j) {
-//         float S_j = curr_S;
-//
-//         // Apply each dividend along this path
-//         if (n_divs > 0) {
-//             for (int div_i = 0; div_i < n_divs; ++div_i) {
-//                 int step_div = div_steps[div_i];
-//                 if (step_div > 0 && step_div <= N) {
-//                     int ups_before_div   = (step_div <= j) ? step_div : j;
-//                     int downs_before_div = step_div - ups_before_div;
-//
-//                     int ups_after_div   = j - ups_before_div;
-//                     int downs_after_div = (N - j) - downs_before_div;
-//
-//                     float mult_after =
-//                         std::pow(u, static_cast<float>(ups_after_div)) *
-//                         std::pow(d, static_cast<float>(downs_after_div));
-//
-//                     S_j -= div_amounts[div_i] * mult_after;
-//                     if (S_j < 1e-8f) S_j = 1e-8f;
-//                 }
-//             }
-//         }
-//
-//         V[j] = is_call ? std::fmax(S_j - K, 0.0f) : std::fmax(K - S_j, 0.0f);
-//         curr_S *= u2;  // move to next node: replace one d with one u
-//     }
-//
-//     // 2. Backward induction with term structure and discrete dividends
-//     for (int step = N - 1; step >= 0; --step) {
-//         float t_curr = step * dt;
-//         float r      = get_rate_at_time_host(t_curr, rates_curve, rates_times, n_rates);
-//         float disc   = std::exp(-r * dt);
-//         float edtr   = std::exp(r * dt);
-//         float p      = (edtr - d) / (u - d);
-//         // clamp to [0,1]
-//         if (p < 0.0f) p = 0.0f;
-//         if (p > 1.0f) p = 1.0f;
-//
-//         for (int j = 0; j <= step; ++j) {
-//             float cont = disc * (p * V[j + 1] + (1.0f - p) * V[j]);
-//
-//             // Rebuild stock at node (step, j) ignoring dividends
-//             float S_j =
-//                 S *
-//                 std::pow(u, static_cast<float>(j)) *
-//                 std::pow(d, static_cast<float>(step - j));
-//
-//             // Apply all dividends that have occurred up to and including this step
-//             if (n_divs > 0) {
-//                 for (int div_i = 0; div_i < n_divs; ++div_i) {
-//                     int step_div = div_steps[div_i];
-//                     if (step_div <= step && step_div > 0) {
-//                         int ups_before_div   = (step_div <= j) ? step_div : j;
-//                         int downs_before_div = step_div - ups_before_div;
-//
-//                         int ups_after_div   = j - ups_before_div;
-//                         int downs_after_div = (step - j) - downs_before_div;
-//
-//                         float mult_after =
-//                             std::pow(u, static_cast<float>(ups_after_div)) *
-//                             std::pow(d, static_cast<float>(downs_after_div));
-//
-//                         S_j -= div_amounts[div_i] * mult_after;
-//                         if (S_j < 1e-8f) S_j = 1e-8f;
-//                     }
-//                 }
-//             }
-//
-//             float ex = is_call ? std::fmax(S_j - K, 0.0f) : std::fmax(K - S_j, 0.0f);
-//             V[j] = std::fmax(cont, ex);
-//         }
-//     }
-//     return V[0];
-// }
 
-// float implied_vol_american_bisection_threadlocal_host(
-//     float target, float S, float K, float T, uint8_t is_call, int n_steps,
-//     const float *rates_curve, const float *rates_times, int n_rates,
-//     const float *div_amounts, const int *div_steps, int n_divs,
-//     float tol = 1e-6f, int max_iter = 100, float v_min = 1e-4f, float v_max = 5.0f) {
-//     float p_low = price_american_binomial_cash_div_threadlocal_host(S, K, T, v_min, is_call, n_steps, rates_curve,
-//                                                                rates_times, n_rates, div_amounts, div_steps, n_divs);
-//     float p_high = price_american_binomial_cash_div_threadlocal_host(S, K, T, v_max, is_call, n_steps, rates_curve,
-//                                                                 rates_times, n_rates, div_amounts, div_steps, n_divs);
-//     if (target <= p_low + 1e-12f) return 0.0f;
-//     if (target > p_high + 1e-12f) return NAN;
-//
-//     float lo = v_min, hi = v_max, mid = 0.0f;
-//     for (int i = 0; i < max_iter; ++i) {
-//         mid = 0.5f * (lo + hi);
-//         float p_mid = price_american_binomial_cash_div_threadlocal_host(S, K, T, mid, is_call, n_steps, rates_curve,
-//                                                                    rates_times, n_rates, div_amounts, div_steps,
-//                                                                    n_divs);
-//         float diff = p_mid - target;
-//         if (fabsf(diff) < tol) return mid;
-//         if (diff < 0.0f) lo = mid;
-//         else hi = mid;
-//         if (hi - lo < tol) break;
-//     }
-//     return mid;
-// }
+// ---- NEW: public wrappers for tests/diagnostics (no duplicated math) ----
+float merlin_df_0_t_host(
+    float t,
+    const std::vector<float>& rates_curve,
+    const std::vector<float>& rates_times)
+{
+    const float* rc = rates_curve.empty() ? nullptr : rates_curve.data();
+    const float* rt = rates_times.empty() ? nullptr : rates_times.data();
+    const int n_rates = static_cast<int>(rates_curve.size());
+    return df_0_t_host(t, rc, rt, n_rates);
+}
 
-// float get_single_iv_cpu(
-//     float target_price, float S, float K, float T, uint8_t is_call,
-//     const std::vector<float> &rates_curve, const std::vector<float> &rates_times,
-//     const std::vector<float> &div_amounts, const std::vector<float> &div_times,
-//     float tol, int max_iter, const float steps_factor) {
-//
-//     if (T <= 0.0f || S <= 0.0f || K <= 0.0f || target_price <= 0.0f ||
-//         !std::isfinite(target_price) || !std::isfinite(S) ||
-//         !std::isfinite(K) || !std::isfinite(T)) {
-//         return (T <= 0.0f) ? 0.0f : std::numeric_limits<float>::quiet_NaN();
-//     }
-//
-//     // Match the GPU IV kernel convention: n_steps = 200 * steps_factor
-//     int n_steps = static_cast<int>(200 * steps_factor);
-//     if (n_steps < 1) n_steps = 1;
-//
-//     // Prepare rate pointers for the host pricer
-//     const float *rates_curve_ptr = rates_curve.empty() ? nullptr : rates_curve.data();
-//     const float *rates_times_ptr = rates_times.empty() ? nullptr : rates_times.data();
-//     int n_rates = static_cast<int>(rates_curve.size());
-//
-//     // Map dividend times to integer steps exactly as compute_iv_kernel_threadlocal does
-//     const int MAX_DIVS = 32;
-//     float local_div_amounts[MAX_DIVS];
-//     int   local_div_steps[MAX_DIVS];
-//     int   valid_divs = 0;
-//
-//     int n_divs = static_cast<int>(div_amounts.size());
-//     for (int j = 0; j < n_divs && j < MAX_DIVS; ++j) {
-//         float div_time = div_times[j];
-//         if (div_time > 0.0f && div_time < T) {
-//             int step = (int) roundf(div_time / T * n_steps);
-//             step = std::max(1, std::min(step, n_steps));
-//             local_div_steps[valid_divs] = step;
-//             local_div_amounts[valid_divs] = div_amounts[j];
-//             valid_divs++;
-//         }
-//     }
-//
-//     return implied_vol_american_bisection_threadlocal_host(target_price, S, K, T, is_call, n_steps,
-//     rates_curve_ptr, rates_times_ptr, n_rates,
-//     local_div_amounts, local_div_steps, valid_divs
-//     );
-// }
+float merlin_df_t_T_host(
+    float t,
+    float T,
+    const std::vector<float>& rates_curve,
+    const std::vector<float>& rates_times)
+{
+    const float* rc = rates_curve.empty() ? nullptr : rates_curve.data();
+    const float* rt = rates_times.empty() ? nullptr : rates_times.data();
+    const int n_rates = static_cast<int>(rates_curve.size());
+    return df_t_T_host(t, T, rc, rt, n_rates);
+}
+
+float merlin_forward_rate_host(
+    float t,
+    const std::vector<float>& rates_curve,
+    const std::vector<float>& rates_times)
+{
+    const float* rc = rates_curve.empty() ? nullptr : rates_curve.data();
+    const float* rt = rates_times.empty() ? nullptr : rates_times.data();
+    const int n_rates = static_cast<int>(rates_curve.size());
+    return get_rate_at_time_host(t, rc, rt, n_rates);
+}
+
+float merlin_forward_rate_convex_monotone_host(
+    float t,
+    const std::vector<float>& rates_curve,
+    const std::vector<float>& rates_times)
+{
+    const float* rc = rates_curve.empty() ? nullptr : rates_curve.data();
+    const float* rt = rates_times.empty() ? nullptr : rates_times.data();
+    const int n_rates = static_cast<int>(rates_curve.size());
+    return get_rate_at_time_convex_monotone_host(t, rc, rt, n_rates);
+}

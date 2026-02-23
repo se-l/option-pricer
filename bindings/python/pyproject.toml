@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "merlin"
-version = "0.1.2"
+version = "0.1.8"
 #author = "Sebastian Lueneburg"
 #author-email = "sebastian.lueneburg@gmail.com"
 description = "Merlin Python extension (pybind11 + CUDA)"
