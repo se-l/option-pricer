@@ -675,12 +675,15 @@ __global__ void compute_price_kernel_threadlocal(
     const float sigma = sigmas[idx];
     const int right = rights[idx];
 
-    if (!isfinite(s) || !isfinite(k) || !isfinite(t) || !isfinite(sigma) ||
-        t <= 0.0f || s <= 0.0f || k <= 0.0f || sigma <= 0.0f) {
-        if (t <= 0.0f || s <= 0.0f || k <= 0.0f || sigma <= 0.0f)
-            out_price[idx] = right == 1 ? std::fmax(s - k, 0.0f) : std::fmax(k - s, 0.0f);
+    if (!isfinite(s) || !isfinite(k) || !isfinite(t) || !isfinite(sigma)) {
+        out_price[idx] = NAN;
         return;
-        }
+    }
+
+    if (t <= 0.0f || s <= 0.0f || k <= 0.0f || sigma <= 0.0f) {
+        out_price[idx] = right == 1 ? fmaxf(s - k, 0.0f) : fmaxf(k - s, 0.0f);
+        return;
+    }
 
     const int tid = tenor_ids[idx];
     const float pv_divs = pv_divs_by_tenor[tid];
@@ -1343,7 +1346,7 @@ std::vector<float> get_v_fd_vega_cuda(
     const std::vector<float> &div_times)
 {
     const int n_options = static_cast<int>(spots.size());
-    std::vector<float> vegas(n_options, std::numeric_limits<float>::quiet_NaN());
+    std::vector vegas(n_options, std::numeric_limits<float>::quiet_NaN());
     if (n_options == 0) return vegas;
 
     if (strikes.size() != static_cast<size_t>(n_options) ||

@@ -391,112 +391,69 @@ TEST_CASE("Circular consistency: GPU FD price -> GPU FD IV -> GPU FD price", "[p
     }
 
 
-// TEST_CASE("Circular consistency: CPU FD price -> CPU FD IV -> CPU FD price", "[pricing][iv][cuda]") {
-//         // Goal:
-//         // 1) Price on GPU with get_v_fd_price_cuda using a known sigma
-//         // 2) Recover sigma from that GPU price via get_v_iv_fd_cuda_new
-//         // 3) (Optional but useful) Re-price using recovered sigma and verify we match the original price
-//
-//         std::vector<uint8_t> rights = {1, 0}; // Call, Put
-//         std::vector tenors = {0.05f, 0.25f, 1.0f, 3.0f}; // short/medium/long
-//         float S = 100.0f;
-//
-//         // strikes cover ITM/ATM/OTM for both calls and puts
-//         std::vector strikes = {70.0f, 90.0f, 100.0f, 110.0f, 130.0f};
-//
-//         // Use a couple of vol levels to make sure solver isn't tuned to one case
-//         std::vector sigmas = {0.15f, 0.30f, 0.60f};
-//
-//         std::vector rates_curve = {0.03f, 0.1f, 0.03f};
-//         std::vector rates_times = {0.2f, 0.8f, 1.5f};
-//         std::vector div_amounts = {1.0f, 1.50f, 2.0f};
-//         std::vector div_times = {0.3f, 0.9f, 1.3f};
-//
-//         const int time_steps = 200;
-//         const int space_steps = 200;
-//
-//         // Build vectorized inputs
-//         std::vector<float> v_spots, v_strikes, v_tenors, v_sigmas;
-//         std::vector<uint8_t> v_rights;
-//
-//         for (auto r : rights) {
-//             for (auto t : tenors) {
-//                 for (auto k : strikes) {
-//                     for (auto sigma : sigmas) {
-//                         v_spots.push_back(S);
-//                         v_strikes.push_back(k);
-//                         v_tenors.push_back(t);
-//                         v_sigmas.push_back(sigma);
-//                         v_rights.push_back(r);
-//                     }
-//                 }
-//             }
-//         }
-//
-//         // 1) GPU price using "true" sigma
-//         std::vector<float> v_prices = v_fd_price_host(
-//             v_spots, v_strikes, v_tenors, v_sigmas, v_rights,
-//             rates_curve, rates_times,
-//             div_amounts, div_times,
-//             time_steps, space_steps
-//         );
-//         REQUIRE(v_prices.size() == v_spots.size());
-//
-//         // Some deep OTM short-dated options can be numerically ~0; filter them out for IV recovery.
-//         std::vector<float> f_prices, f_spots, f_strikes, f_tenors, f_sigmas;
-//         std::vector<uint8_t> f_rights;
-//
-//         f_prices.reserve(v_prices.size());
-//         f_spots.reserve(v_prices.size());
-//         f_strikes.reserve(v_prices.size());
-//         f_tenors.reserve(v_prices.size());
-//         f_sigmas.reserve(v_prices.size());
-//         f_rights.reserve(v_prices.size());
-//
-//         for (size_t i = 0; i < v_prices.size(); ++i) {
-//             if (std::isfinite(v_prices[i]) && v_prices[i] > 1e-4f) {
-//                 f_prices.push_back(v_prices[i]);
-//                 f_spots.push_back(v_spots[i]);
-//                 f_strikes.push_back(v_strikes[i]);
-//                 f_tenors.push_back(v_tenors[i]);
-//                 f_sigmas.push_back(v_sigmas[i]);
-//                 f_rights.push_back(v_rights[i]);
-//             }
-//         }
-//
-//         REQUIRE(f_prices.size() > 0);
-//
-//         // 2) Recover IV on GPU from those GPU prices
-//         std::vector<float> recovered_ivs = get_v_iv_fd_cpu(
-//             f_prices, f_spots, f_strikes, f_tenors, f_rights,
-//             rates_curve, rates_times, div_amounts, div_times,
-//             1e-6f, 100, 1e-4f, 5.0f, time_steps, space_steps
-//         );
-//
-//         // 3) Re-price with recovered IV and compare to original price
-//         std::vector<float> reprices = get_v_fd_price_cuda(
-//             f_spots, f_strikes, f_tenors, recovered_ivs, f_rights,
-//             rates_curve, rates_times,
-//             div_amounts, div_times,
-//             time_steps, space_steps
-//         );
-//         REQUIRE(reprices.size() == f_prices.size());
-//
-//         const float price_rel_tol = 2e-3f;   // price should close back reasonably well
-//
-//         for (size_t i = 0; i < f_prices.size(); ++i) {
-//             const std::string type = f_rights[i] ? "Call" : "Put";
-//             DYNAMIC_SECTION("Circular " << type
-//                             << " T=" << f_tenors[i]
-//                             << " K=" << f_strikes[i]
-//                             << " sigma=" << f_sigmas[i]) {
-//                 REQUIRE(std::isfinite(recovered_ivs[i]));
-//                 CHECK(recovered_ivs[i] >= 0.0f);
-//
-//                 // Re-priced value matches original price
-//                 CHECK(std::isfinite(reprices[i]));
-//                 CHECK_THAT(reprices[i], Catch::Matchers::WithinRel(f_prices[i], price_rel_tol) ||
-//                                        Catch::Matchers::WithinAbs(f_prices[i], 1e-4f));
-//             }
-//         }
-//     }
+TEST_CASE("Bad IV inputs return intrinsic for non-positive vol and NaN for NaN vol", "[pricing][cuda][host]") {
+    const std::vector spots   = {100.0f, 100.0f, 100.0f, 100.0f, 100.0f, 100.0f};
+    const std::vector strikes = { 90.0f,  90.0f,  90.0f, 110.0f, 110.0f, 110.0f};
+    const std::vector tenors  = {  1.0f,   1.0f,   1.0f,   1.0f,   1.0f,   1.0f};
+    const std::vector<uint8_t> rights = {1, 1, 1, 0, 0, 0};
+    const std::vector sigmas = {
+        0.0f,
+        -1.0f,
+        std::numeric_limits<float>::quiet_NaN(),
+        0.0f,
+        -1.0f,
+        std::numeric_limits<float>::quiet_NaN()
+    };
+
+    const std::vector expected = {
+        10.0f, 10.0f, std::numeric_limits<float>::quiet_NaN(),
+        10.0f, 10.0f, std::numeric_limits<float>::quiet_NaN()
+    };
+
+    const std::vector rates_curve = {0.0f, 0.0f};
+    const std::vector rates_times = {0.0f, 99.0f};
+    const std::vector<float> div_amounts = {};
+    const std::vector<float> div_times = {};
+
+    SECTION("GPU vectorized pricer") {
+        const std::vector<float> res = get_v_price_fd_cuda(
+            spots, strikes, tenors, sigmas, rights,
+            rates_curve, rates_times,
+            div_amounts, div_times,
+            200, 200
+        );
+
+        REQUIRE(res.size() == expected.size());
+
+        for (size_t i = 0; i < res.size(); ++i) {
+            DYNAMIC_SECTION("GPU i=" << i) {
+                if (std::isnan(expected[i])) {
+                    CHECK(std::isnan(res[i]));
+                } else {
+                    CHECK_THAT(res[i], Catch::Matchers::WithinAbs(expected[i], 1e-6f));
+                }
+            }
+        }
+    }
+
+    SECTION("CPU scalar pricer") {
+        REQUIRE(spots.size() == expected.size());
+
+        for (size_t i = 0; i < spots.size(); ++i) {
+            const float res = price_american_fd_div_host(
+                spots[i], strikes[i], tenors[i], sigmas[i], rights[i],
+                rates_curve, rates_times,
+                div_amounts, div_times,
+                200, 200
+            );
+
+            DYNAMIC_SECTION("CPU i=" << i) {
+                if (std::isnan(expected[i])) {
+                    CHECK(std::isnan(res));
+                } else {
+                    CHECK_THAT(res, Catch::Matchers::WithinAbs(expected[i], 1e-6f));
+                }
+            }
+        }
+    }
+}

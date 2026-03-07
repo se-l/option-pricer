@@ -9,6 +9,8 @@ CUDA enabled option pricer with python stubs to price millions of independent am
 2. Run the following commands in the command prompt:
    ```sh
    cd C:\repos\option-pricer
+   # Possibly activate target environment
+   # activate py314
    python -m pip install .\bindings\python
    ```
    

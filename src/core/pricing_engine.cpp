@@ -194,6 +194,10 @@ float price_american_fd_div_host(
     int time_steps = 200,
     int space_steps = 200)
 {
+    if (!std::isfinite(sigma) || !std::isfinite(S) || !std::isfinite(K) || !std::isfinite(T)) {
+        return std::numeric_limits<float>::quiet_NaN();
+    }
+
     if (T <= 0.0f || S <= 0.0f || K <= 0.0f || sigma <= 0.0f)
         return is_call ? std::fmax(S - K, 0.0f) : std::fmax(K - S, 0.0f);
 

@@ -74,6 +74,20 @@ PYBIND11_MODULE(merlin, m) {
         py::arg("time_steps"), py::arg("space_steps")
         );
 
+    m.def("get_v_fd_delta", &get_v_fd_delta_cuda,
+        "Compute American option deltas in vectorized fashion with per-option sigma and yield curve",
+        py::arg("spots"), py::arg("strikes"), py::arg("tenors"), py::arg("v_is_call"),
+        py::arg("sigmas"), py::arg("n_steps") = 200,
+        py::arg("rates_curve") = std::vector<float>(), py::arg("rates_times") = std::vector<float>(),
+        py::arg("div_amounts") = std::vector<float>(), py::arg("div_times") = std::vector<float>());
+
+    m.def("get_v_fd_vega", &get_v_fd_vega_cuda,
+        "Compute American option vegas in vectorized fashion with per-option sigma and yield curve",
+        py::arg("spots"), py::arg("strikes"), py::arg("tenors"), py::arg("v_is_call"),
+        py::arg("sigmas"), py::arg("n_steps") = 200,
+        py::arg("rates_curve") = std::vector<float>(), py::arg("rates_times") = std::vector<float>(),
+        py::arg("div_amounts") = std::vector<float>(), py::arg("div_times") = std::vector<float>());
+
     // Calibration residuals: E-SSVI -> IV -> Price -> residuals
     m.def("f_min_price_surface_theta_rho_psi",
         &f_min_price_surface_theta_rho_psi_cuda,
